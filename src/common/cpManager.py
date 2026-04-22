@@ -1,5 +1,6 @@
 import numpy as np
-from config import SsbConfig, OfdmConstants
+
+from common.config import SsbConfig, OfdmConstants
 
 
 class CpManager:
@@ -65,8 +66,7 @@ class CpManager:
         """
         if symbolIndexInSlot == 0:
             return self.longCpLength
-        else:
-            return self.normalCpLength
+        return self.normalCpLength
 
     def getSymbolLength(self, symbolIndexInSlot: int) -> int:
         """

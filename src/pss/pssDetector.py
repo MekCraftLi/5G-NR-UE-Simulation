@@ -1,8 +1,12 @@
+import logging
+
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
-import logging
-from scipy import signal as scipy_signal
-from config import SsbConfig
+from scipy import signal as scipySignal
+
+from common.config import SsbConfig
+
+logger = logging.getLogger(__name__)
 
 
 class PssConstants:
@@ -21,9 +25,9 @@ class PssConstants:
     SectorCount = 3
 
 
-class CellSearcher:
+class PssDetector:
     """
-    小区盲搜引擎 —— 分段互相关 + overlap-save 加速的 PSS 检测
+    PSS 盲搜检测器 —— 分段互相关 + overlap-save 加速
 
     处理流程:
         1. 构造本地 PSS 时域模板 (3 个扇区)
@@ -152,13 +156,14 @@ class CellSearcher:
 
         bestCorr = 0.0
         bestCorrResult = None
+        bestCorrResultsPerNid2 = [None, None, None]  # 最优 GSCN 下 3 个 N_ID_2 的相关曲线
         bestResult = {
             "timingOffset": 0,
-            "nId2": 0,
-            "freqOffset": 0,
-            "gscn": 0,
-            "peakValue": 0.0,
-            "corrArray": None,
+            "nId2":         0,
+            "freqOffset":   0,
+            "gscn":         0,
+            "peakValue":    0.0,
+            "corrArray":    None,
             "searchMatrix": None,
             "peakAnalysis": None
         }
@@ -176,26 +181,31 @@ class CellSearcher:
             # 预计算所有分段的输入块 FFT (3 个 N_ID_2 共享, 节省 2/3 FFT 计算)
             segBlockFfts = self._precomputeInputBlockFfts(rxShifted, outputLength)
 
-            # 对每个 N_ID_2 执行分段相关
+            # 对每个 N_ID_2 执行分段相关，收集全部 3 条曲线
+            currentCorrResultsPerNid2 = []
             for nId2 in range(PssConstants.SectorCount):
                 corrResult = self._segmentedCorrelate(segBlockFfts, nId2, outputLength)
-
+                currentCorrResultsPerNid2.append(corrResult)
                 searchMatrix[freqIdx, :] = np.maximum(searchMatrix[freqIdx, :], corrResult)
 
+            # 在全部 3 条曲线中找全局最优
+            for nId2 in range(PssConstants.SectorCount):
+                corrResult = currentCorrResultsPerNid2[nId2]
                 peakValue = np.max(corrResult)
                 if peakValue > bestCorr:
                     bestCorr = peakValue
                     bestCorrResult = corrResult
+                    bestCorrResultsPerNid2 = list(currentCorrResultsPerNid2)
                     bestResult["timingOffset"] = int(np.argmax(corrResult))
                     bestResult["nId2"] = nId2
                     bestResult["freqOffset"] = testFreqOffset
                     bestResult["gscn"] = gscn
                     bestResult["peakValue"] = float(peakValue)
 
-        # 多峰分析
+        # 多峰分析（传入全部 3 条 N_ID_2 曲线，用于标注每个峰的扇区 ID）
         bestResult["corrArray"] = bestCorrResult
         bestResult["searchMatrix"] = searchMatrix
-        bestResult["peakAnalysis"] = self._analyzePeaks(bestCorrResult)
+        bestResult["peakAnalysis"] = self._analyzePeaks(bestCorrResult, bestCorrResultsPerNid2)
 
         return bestResult
 
@@ -292,7 +302,7 @@ class CellSearcher:
     # 多峰分析
     # =====================================================================
 
-    def _analyzePeaks(self, corrArray: np.ndarray) -> dict:
+    def _analyzePeaks(self, corrArray: np.ndarray, corrResultsPerNid2: list = None) -> dict:
         """
         多峰分析: 在相关曲线上检测显著峰并识别 CP 回波
 
@@ -306,22 +316,23 @@ class CellSearcher:
                - 峰间距 ≈ CP 长度，可用于验证检测结果
 
         参数:
-            corrArray: 互相关幅度曲线
+            corrArray:          互相关幅度曲线（最优 N_ID_2）
+            corrResultsPerNid2: 3 个 N_ID_2 的相关曲线列表，用于标注每个峰的扇区 ID
 
         返回:
-            dict — 多峰分析结果
+            dict — 多峰分析结果，每个峰包含 nId2 字段
         """
         if corrArray is None:
             return None
 
-        # 峰值检测阈值: 最大峰值的 50% (仅保留显著峰)
-        peakThreshold = np.max(corrArray) * 0.5
+        # 峰值检测阈值: 最大峰值的 80% (仅保留显著峰)
+        peakThreshold = np.max(corrArray) * 0.8
 
         # 最小峰间距: 一个 OFDM 符号长度 (避免检测到主瓣旁瓣)
         minPeakDistance = max(self.config.FftSize + self.config.NormalCpLength, 1)
 
         # 检测局部极大值
-        peakIndices, _ = scipy_signal.find_peaks(
+        peakIndices, _ = scipySignal.find_peaks(
             corrArray,
             height=peakThreshold,
             distance=minPeakDistance
@@ -337,9 +348,19 @@ class CellSearcher:
 
         peaks = []
         for i in range(len(topIndices)):
+            idx = int(topIndices[i])
+            # 查找该峰位置上 3 条 N_ID_2 曲线中值最大的扇区 ID
+            nId2 = 0
+            if corrResultsPerNid2 is not None and all(c is not None for c in corrResultsPerNid2):
+                maxVal = corrResultsPerNid2[0][idx]
+                for nid in range(1, PssConstants.SectorCount):
+                    if corrResultsPerNid2[nid][idx] > maxVal:
+                        maxVal = corrResultsPerNid2[nid][idx]
+                        nId2 = nid
             peaks.append({
-                "index": int(topIndices[i]),
-                "value": float(topValues[i])
+                "index": idx,
+                "value": float(topValues[i]),
+                "nId2":  nId2
             })
 
         # =================================================================
@@ -361,43 +382,48 @@ class CellSearcher:
                 if cpEchoPair is None and abs(peakDistance - cpLength) <= cpTolerance:
                     mainPeakIdx = int(topIndices[i])
                     cpEchoIdx = int(topIndices[j])
+                    # 查找主峰和回波峰各自对应的 N_ID_2
+                    mainNId2 = peaks[i]["nId2"] if i < len(peaks) else 0
+                    cpNId2 = peaks[j]["nId2"] if j < len(peaks) else 0
                     cpEchoPair = {
-                        "mainPeakIndex": mainPeakIdx,
-                        "mainPeakValue": float(corrArray[mainPeakIdx]),
+                        "mainPeakIndex":   mainPeakIdx,
+                        "mainPeakValue":   float(corrArray[mainPeakIdx]),
+                        "mainPeakNId2":    mainNId2,
                         "cpEchoPeakIndex": cpEchoIdx,
                         "cpEchoPeakValue": float(corrArray[cpEchoIdx]),
+                        "cpEchoPeakNId2":  cpNId2,
                         "measuredCpLength": peakDistance,
                         "expectedCpLength": cpLength,
-                        "cpLengthError": abs(peakDistance - cpLength)
+                        "cpLengthError":    abs(peakDistance - cpLength)
                     }
 
                 # 近距双峰记录: 间距 < 2 个符号长度
                 if peakDistance < symbolLength * 2:
                     closePeakPairs.append({
-                        "peak1Index": int(topIndices[i]),
-                        "peak1Value": float(topValues[i]),
-                        "peak2Index": int(topIndices[j]),
-                        "peak2Value": float(topValues[j]),
-                        "distance": peakDistance,
+                        "peak1Index":       int(topIndices[i]),
+                        "peak1Value":       float(topValues[i]),
+                        "peak2Index":       int(topIndices[j]),
+                        "peak2Value":       float(topValues[j]),
+                        "distance":         peakDistance,
                         "distanceInSymbols": round(peakDistance / symbolLength, 2)
                     })
 
         result = {
-            "detectedPeaks": peaks,
-            "peakCount": len(peakIndices),
+            "detectedPeaks":  peaks,
+            "peakCount":      len(peakIndices),
             "closePeakPairs": closePeakPairs if closePeakPairs else None,
-            "cpEchoPair": cpEchoPair
+            "cpEchoPair":     cpEchoPair
         }
 
         if closePeakPairs:
             for pair in closePeakPairs:
-                logging.info(f"  近距双峰: 峰1@{pair['peak1Index']}({pair['peak1Value']:.1f}), "
-                             f"峰2@{pair['peak2Index']}({pair['peak2Value']:.1f}), "
-                             f"间距={pair['distance']}点 ({pair['distanceInSymbols']}符号)")
+                logger.info(f"  近距双峰: 峰1@{pair['peak1Index']}({pair['peak1Value']:.1f}), "
+                            f"峰2@{pair['peak2Index']}({pair['peak2Value']:.1f}), "
+                            f"间距={pair['distance']}点 ({pair['distanceInSymbols']}符号)")
         if cpEchoPair is not None:
-            logging.info(f"  CP 回波检测: 主峰@{cpEchoPair['mainPeakIndex']}, "
-                         f"回波峰@{cpEchoPair['cpEchoPeakIndex']}, "
-                         f"测量CP长度={cpEchoPair['measuredCpLength']} "
-                         f"(预期={cpLength}, 误差={cpEchoPair['cpLengthError']})")
+            logger.info(f"  CP 回波检测: 主峰@{cpEchoPair['mainPeakIndex']}, "
+                        f"回波峰@{cpEchoPair['cpEchoPeakIndex']}, "
+                        f"测量CP长度={cpEchoPair['measuredCpLength']} "
+                        f"(预期={cpLength}, 误差={cpEchoPair['cpLengthError']})")
 
         return result

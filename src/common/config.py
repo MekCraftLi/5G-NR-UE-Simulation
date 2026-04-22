@@ -1,4 +1,3 @@
-import numpy as np
 from dataclasses import dataclass
 
 
@@ -8,16 +7,16 @@ class BandRasterConfig:
     频段同步栅格配置 —— 依据 TS 38.101-1 Table 5.4.3.3-1
 
     字段说明:
-        FirstGscn  : 该频段起始 GSCN
-        LastGscn   : 该频段结束 GSCN
-        StepSize   : GSCN 步进
-        Scs        : SS Block 子载波间隔 (Hz)
+        FirstGscn      : 该频段起始 GSCN
+        LastGscn       : 该频段结束 GSCN
+        StepSize       : GSCN 步进
+        Scs            : SS Block 子载波间隔 (Hz)
         SsBlockPattern : SS Block Pattern (Case A/B/C/D/E)
     """
     FirstGscn: int
     LastGscn: int
     StepSize: int
-    Scs: int = 30000  # 子载波间隔 (Hz)
+    Scs: int = 30000                # 子载波间隔 (Hz)
     SsBlockPattern: str = "Case C"  # SS Block Pattern
 
 
@@ -33,11 +32,11 @@ class BandConstants:
         - Case E: SCS = 240 kHz (FR2)
 
     字段说明:
-        BandN1   : n1 频段,  SCS=15kHz,  Case A
-        BandN41A : n41 频段, SCS=15kHz,  Case A
-        BandN41C : n41 频段, SCS=30kHz,  Case C
-        BandN78   : n78 频段, SCS=30kHz, Case C
-        BandN104  : n104 频段, SCS=30kHz, Case C
+        BandN1   : n1  频段, SCS=15kHz, Case A
+        BandN41A : n41 频段, SCS=15kHz, Case A
+        BandN41C : n41 频段, SCS=30kHz, Case C
+        BandN78  : n78 频段, SCS=30kHz, Case C
+        BandN104 : n104频段, SCS=30kHz, Case C
     """
     # n1 频段: 2100 MHz 范围
     BandN1 = BandRasterConfig(FirstGscn=5279, LastGscn=5419, StepSize=1, Scs=15000, SsBlockPattern="Case A")
@@ -125,19 +124,6 @@ class SsbConfig:
             else:
                 raise ValueError(f"未找到 SCS={self.SubcarrierSpacing} 对应的频段栅格条目")
 
-    def getSymbolLength(self, symbolIndexInSlot: int = 0) -> int:
-        """
-        获取 OFDM 符号总长度 (FFT + CP)
-
-        参数:
-            symbolIndexInSlot: 时隙内符号索引，0 表示长 CP，其他为常规 CP
-
-        返回:
-            符号长度 (采样点数)
-        """
-        # 长CP计算由 CpManager 负责，此处简化返回常规CP长度
-        return self.FftSize + self.NormalCpLength
-
 
 def createSsbConfig(sampleRate: float, subcarrierSpacing: int) -> SsbConfig:
     """
@@ -148,7 +134,7 @@ def createSsbConfig(sampleRate: float, subcarrierSpacing: int) -> SsbConfig:
         2. 常规 CP 长度 = 基准 CP × (FFT / 基准 FFT)
 
     参数:
-        sampleRate: 采样率 (Hz)
+        sampleRate:        采样率 (Hz)
         subcarrierSpacing: 子载波间隔 (Hz)
 
     返回:
