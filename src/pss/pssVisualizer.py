@@ -9,302 +9,359 @@ logger = logging.getLogger(__name__)
 
 
 class PssVisualizer:
-    """
-    PSS 盲搜结果可视化与记录
-
-    输出:
-        - output/pss_search_heatmap.png : 2D 热力图 + 1D 相关峰剖面 (含多峰标注 + 放大视图)
-        - output/pss_search_result.json : 盲搜结果参数 (含多峰分析)
-    """
-
-    # 输出目录 (相对于 src/)
     OutputDir = os.path.join(os.path.dirname(__file__), '..', '..', 'output')
+    TimeScanSamples = 15000
 
     @classmethod
     def _ensureOutputDir(cls):
-        """确保输出目录存在"""
         os.makedirs(cls.OutputDir, exist_ok=True)
 
     @staticmethod
-    def _downsampleColumns(matrix: np.ndarray, maxCols: int) -> tuple:
-        """
-        对 2D 矩阵按列降采样，避免 imshow 分配过大内存
-
-        参数:
-            matrix  — 原始矩阵 (freqCount × timeCount)
-            maxCols — 降采样后最大列数
-
-        返回:
-            (downsampled, step) — 降采样后矩阵与采样步长
-        """
-        _, cols = matrix.shape
-        if cols <= maxCols:
-            return matrix, 1
-        step = cols // maxCols
-        return matrix[:, ::step], step
+    def _getNid2ResultMap(detectResult: dict) -> dict:
+        resultMap = {}
+        for item in detectResult.get("nId2BestResults", []):
+            resultMap[int(item["nId2"])] = item
+        return resultMap
 
     @staticmethod
-    def plotPssSearchValidation(detectResult: dict, validGscnList: list, rxLength: int):
-        """
-        可视化 PSS 盲搜结果并保存到本地
+    def plotPssSearchValidation(
+        detectResult: dict,
+        validGscnList: list,
+        rxLength: int,
+        outputPrefix: str = "",
+    ):
+        del validGscnList
+        del rxLength
 
-        生成内容:
-            1. 2D 热力图 (全局 + 放大): 候选频点 (纵轴) × 时延采样点 (横轴)
-            2. 1D 相关峰剖面 (全局 + 放大): 最优频点处的互相关幅度曲线 (含多峰标注)
-            3. JSON 结果文件: 盲搜检测参数
-
-        参数:
-            detectResult   : PssDetector.detectPss() 的返回值
-            validGscnList  : 候选频点列表 [(gscn, freqOffset), ...]
-            rxLength       : 接收信号长度 (采样点数)
-        """
         PssVisualizer._ensureOutputDir()
 
-        fig = plt.figure(figsize=(18, 12))
+        nid2Map = PssVisualizer._getNid2ResultMap(detectResult)
+        for nid2 in [0, 1, 2]:
+            if nid2 not in nid2Map:
+                raise ValueError(f"Missing nId2 result for nId2={nid2}")
 
-        # 放大范围: 前 50000 个采样点
-        zoomSamples = 50000
+        scanSamples = PssVisualizer.TimeScanSamples
+        scoreMode = str(detectResult.get("scoreMode", "raw")).lower()
+        yLabel = "Normalized Correlation" if scoreMode == "ncc" else "Correlation Magnitude"
+        fig = plt.figure(figsize=(18, 10))
+        overlayPeak = {
+            "nId2": 0,
+            "sampleIndex": 0,
+            "peakValue": -1.0,
+        }
+        colors = {0: "tab:blue", 1: "tab:orange", 2: "tab:green"}
 
-        # 渲染降采样上限 (防止 OOM)
-        maxHeatmapCols = 4000
-        maxPlotPoints  = 5000
+        for plotIdx, nid2 in enumerate([0, 1, 2], start=1):
+            result = nid2Map[nid2]
+            corrArray = np.asarray(result["corrArray"])
+            scanEnd = min(scanSamples, len(corrArray))
+            x = np.arange(scanEnd)
+            y = corrArray[:scanEnd]
 
-        searchMatrix = detectResult["searchMatrix"]
-        corrArray    = detectResult["corrArray"]
-        freqLabels   = [f"{gscn} ({offset / 1e6:.2f} MHz)" for gscn, offset in validGscnList]
-        bestFreqIdx  = [item[0] for item in validGscnList].index(detectResult["gscn"])
+            peakIdxLocal = int(np.argmax(y))
+            peakValLocal = float(y[peakIdxLocal])
+            if peakValLocal > overlayPeak["peakValue"]:
+                overlayPeak = {
+                    "nId2": nid2,
+                    "sampleIndex": peakIdxLocal,
+                    "peakValue": peakValLocal,
+                }
 
-        # =================================================================
-        # 1. 2D 搜索热力图 (全局，降采样)
-        # =================================================================
-        ax1 = plt.subplot(2, 2, 1)
-        dsMatrix, dsStep = PssVisualizer._downsampleColumns(searchMatrix, maxHeatmapCols)
-        dsCols = dsMatrix.shape[1]
+            ax = plt.subplot(2, 2, plotIdx)
+            ax.plot(x, y, color=colors[nid2], linewidth=1.0)
+            ax.plot(peakIdxLocal, peakValLocal, "r^", markersize=8)
+            ax.set_title(
+                f"N_ID_2={nid2} | bestFreq={result['freqOffset']:.1f} Hz | "
+                f"bestPeak={result['peakValue']:.3f}"
+            )
+            ax.set_xlabel("Timing Offset (samples)")
+            ax.set_ylabel(yLabel)
+            ax.grid(True, linestyle="--", alpha=0.5)
 
-        cax = ax1.imshow(dsMatrix, aspect='auto', cmap='plasma', origin='lower',
-                         extent=[0, searchMatrix.shape[1], -0.5, len(freqLabels) - 0.5])
-        fig.colorbar(cax, ax=ax1, label='Correlation Magnitude')
-        ax1.set_yticks(np.arange(len(freqLabels)))
-        ax1.set_yticklabels(freqLabels)
-        ax1.set_title(f'2D PSS Search Heatmap (Peak at GSCN: {detectResult["gscn"]})')
-        ax1.set_ylabel('GSCN Candidate (Frequency Offset)')
-        ax1.set_xlabel('Timing Offset (Samples)')
+        axOverlay = plt.subplot(2, 2, 4)
+        for nid2 in [0, 1, 2]:
+            result = nid2Map[nid2]
+            corrArray = np.asarray(result["corrArray"])
+            scanEnd = min(scanSamples, len(corrArray))
+            x = np.arange(scanEnd)
+            y = corrArray[:scanEnd]
+            axOverlay.plot(x, y, color=colors[nid2], linewidth=1.0, label=f"N_ID_2={nid2}")
 
-        # 标出最大峰值位置 (使用原始坐标)
-        ax1.plot(detectResult["timingOffset"], bestFreqIdx, 'ro', markersize=10, fillstyle='none', markeredgewidth=2)
-
-        # =================================================================
-        # 2. 2D 搜索热力图 (放大: 前 zoomSamples 个采样点)
-        # =================================================================
-        ax3 = plt.subplot(2, 2, 2)
-        zoomEnd = min(zoomSamples, searchMatrix.shape[1])
-        cax3 = ax3.imshow(searchMatrix[:, :zoomEnd], aspect='auto', cmap='plasma', origin='lower')
-        fig.colorbar(cax3, ax=ax3, label='Correlation Magnitude')
-        ax3.set_yticks(np.arange(len(freqLabels)))
-        ax3.set_yticklabels(freqLabels)
-        ax3.set_title(f'2D Heatmap Zoomed (0 ~ {zoomEnd} samples)')
-        ax3.set_ylabel('GSCN Candidate (Frequency Offset)')
-        ax3.set_xlabel('Timing Offset (Samples)')
-
-        # 标出峰值（若在放大范围内）
-        if detectResult["timingOffset"] < zoomEnd:
-            ax3.plot(detectResult["timingOffset"], bestFreqIdx, 'ro', markersize=10, fillstyle='none', markeredgewidth=2)
-
-        # =================================================================
-        # 3. 1D 相关峰剖面 (全局，降采样)
-        # =================================================================
-        ax2 = plt.subplot(2, 2, 3)
-        corrLen = len(corrArray)
-        if corrLen > maxPlotPoints:
-            corrStep = corrLen // maxPlotPoints
-            dsX = np.arange(0, corrLen, corrStep)
-            dsY = corrArray[::corrStep]
-            ax2.plot(dsX, dsY, color='b', linewidth=1)
-        else:
-            ax2.plot(corrArray, color='b', linewidth=1)
-
-        # --- 标注主峰 ---
-        peakX = detectResult["timingOffset"]
-        peakY = detectResult["peakValue"]
-        ax2.plot(peakX, peakY, 'r^', markersize=10)
-        ax2.annotate(f'Main Peak\nOffset: {peakX}\nN_ID_2: {detectResult["nId2"]}',
-                     xy=(peakX, peakY), xytext=(peakX + rxLength * 0.05, peakY * 0.9),
-                     arrowprops=dict(facecolor='red', shrink=0.05, width=1.5, headwidth=6))
-
-        # --- 标注所有检测到的显著峰 ---
-        peakAnalysis = detectResult.get("peakAnalysis")
-        if peakAnalysis and peakAnalysis.get("detectedPeaks"):
-            for i, peak in enumerate(peakAnalysis["detectedPeaks"]):
-                if peak["index"] == peakX:
-                    continue  # 主峰已标注，跳过
-                ax2.plot(peak["index"], peak["value"], 'g^', markersize=8)
-                ax2.annotate(f'Peak {i}\nOffset: {peak["index"]}\nVal: {peak["value"]:.1f}',
-                             xy=(peak["index"], peak["value"]),
-                             xytext=(peak["index"] + rxLength * 0.03, peak["value"] * 0.85),
-                             fontsize=7,
-                             arrowprops=dict(facecolor='green', shrink=0.05, width=1, headwidth=4))
-
-        # --- 标注 CP 回波对 ---
-        if peakAnalysis and peakAnalysis.get("cpEchoPair"):
-            cpPair = peakAnalysis["cpEchoPair"]
-            mainIdx = cpPair["mainPeakIndex"]
-            echoIdx = cpPair["cpEchoPeakIndex"]
-
-            # 绘制主峰和回波峰之间的连线
-            ax2.plot([echoIdx, mainIdx], [cpPair["cpEchoPeakValue"], cpPair["mainPeakValue"]],
-                     'r--', linewidth=1.5, alpha=0.7)
-
-            # 在连线中点标注 CP 长度信息
-            midX = (mainIdx + echoIdx) / 2
-            midY = (cpPair["mainPeakValue"] + cpPair["cpEchoPeakValue"]) / 2
-            ax2.annotate(f'CP Echo\nΔ={cpPair["measuredCpLength"]} samples\n(expected: {cpPair["expectedCpLength"]})',
-                         xy=(midX, midY), xytext=(midX, midY * 1.3),
-                         fontsize=8, color='red',
-                         ha='center',
-                         arrowprops=dict(facecolor='red', shrink=0.05, width=1, headwidth=4))
-
-        ax2.set_title('1D PSS Cross-Correlation Profile (Full)')
-        ax2.set_ylabel('Magnitude')
-        ax2.set_xlabel('Timing Offset (Samples)')
-        ax2.grid(True, linestyle='--', alpha=0.7)
-
-        # =================================================================
-        # 4. 1D 相关峰剖面 (放大: 前 zoomSamples 个采样点)
-        # =================================================================
-        ax4 = plt.subplot(2, 2, 4)
-        ax4.plot(corrArray[:zoomEnd], color='b', linewidth=1)
-
-        # --- 标注主峰（若在放大范围内）---
-        if peakX < zoomEnd:
-            ax4.plot(peakX, peakY, 'r^', markersize=10)
-            ax4.annotate(f'Main Peak\nOffset: {peakX}\nN_ID_2: {detectResult["nId2"]}',
-                         xy=(peakX, peakY), xytext=(peakX + zoomEnd * 0.08, peakY * 0.9),
-                         arrowprops=dict(facecolor='red', shrink=0.05, width=1.5, headwidth=6))
-
-        # --- 标注放大范围内的显著峰 ---
-        if peakAnalysis and peakAnalysis.get("detectedPeaks"):
-            for i, peak in enumerate(peakAnalysis["detectedPeaks"]):
-                if peak["index"] >= zoomEnd:
-                    continue  # 超出放大范围，跳过
-                if peak["index"] == peakX:
-                    continue  # 主峰已标注，跳过
-                ax4.plot(peak["index"], peak["value"], 'g^', markersize=8)
-                ax4.annotate(f'Peak {i}\nOffset: {peak["index"]}\nN_ID_2: {peak["nId2"]}\nVal: {peak["value"]:.1f}',
-                             xy=(peak["index"], peak["value"]),
-                             xytext=(peak["index"] + zoomEnd * 0.05, peak["value"] * 0.85),
-                             fontsize=7,
-                             arrowprops=dict(facecolor='green', shrink=0.05, width=1, headwidth=4))
-
-        # --- 标注 CP 回波对（若在放大范围内）---
-        if peakAnalysis and peakAnalysis.get("cpEchoPair"):
-            cpPair = peakAnalysis["cpEchoPair"]
-            mainIdx = cpPair["mainPeakIndex"]
-            echoIdx = cpPair["cpEchoPeakIndex"]
-            if mainIdx < zoomEnd and echoIdx < zoomEnd:
-                ax4.plot([echoIdx, mainIdx], [cpPair["cpEchoPeakValue"], cpPair["mainPeakValue"]],
-                         'r--', linewidth=1.5, alpha=0.7)
-                midX = (mainIdx + echoIdx) / 2
-                midY = (cpPair["mainPeakValue"] + cpPair["cpEchoPeakValue"]) / 2
-                ax4.annotate(f'CP Echo\nΔ={cpPair["measuredCpLength"]} samples',
-                             xy=(midX, midY), xytext=(midX, midY * 1.3),
-                             fontsize=8, color='red', ha='center',
-                             arrowprops=dict(facecolor='red', shrink=0.05, width=1, headwidth=4))
-
-        ax4.set_title(f'1D Profile Zoomed (0 ~ {zoomEnd} samples)')
-        ax4.set_ylabel('Magnitude')
-        ax4.set_xlabel('Timing Offset (Samples)')
-        ax4.grid(True, linestyle='--', alpha=0.7)
+        axOverlay.plot(overlayPeak["sampleIndex"], overlayPeak["peakValue"], "r^", markersize=10)
+        axOverlay.annotate(
+            f"Global Peak\nN_ID_2={overlayPeak['nId2']}\n"
+            f"idx={overlayPeak['sampleIndex']}\n"
+            f"val={overlayPeak['peakValue']:.3f}",
+            xy=(overlayPeak["sampleIndex"], overlayPeak["peakValue"]),
+            xytext=(
+                overlayPeak["sampleIndex"] + scanSamples * 0.05,
+                overlayPeak["peakValue"] * 0.9,
+            ),
+            arrowprops=dict(facecolor="red", shrink=0.05, width=1.2, headwidth=6),
+        )
+        axOverlay.set_title(f"Overlay (N_ID_2=0/1/2, first {scanSamples} samples)")
+        axOverlay.set_xlabel("Timing Offset (samples)")
+        axOverlay.set_ylabel(yLabel)
+        axOverlay.grid(True, linestyle="--", alpha=0.5)
+        axOverlay.legend()
 
         plt.tight_layout()
 
-        # =================================================================
-        # 保存图片到本地
-        # =================================================================
-        imgPath = os.path.join(PssVisualizer.OutputDir, 'pss_search_heatmap.png')
+        prefix = f"{outputPrefix}_" if outputPrefix else ""
+        imgPath = os.path.join(PssVisualizer.OutputDir, f"{prefix}pss_nid2_time_scan.png")
         fig.savefig(imgPath, dpi=150, bbox_inches='tight')
         plt.close(fig)
-        logger.info(f"热力图已保存: {os.path.abspath(imgPath)}")
+        logger.info(f"N_ID_2 time-scan figure saved: {os.path.abspath(imgPath)}")
 
-        # =================================================================
-        # 保存盲搜结果到 JSON
-        # =================================================================
-        PssVisualizer._saveResult(detectResult, validGscnList)
+        PssVisualizer._plotPssFreqOffsetEstimation(detectResult, outputPrefix=outputPrefix)
+        PssVisualizer._plotCpFreqOffsetEstimation(detectResult, outputPrefix=outputPrefix)
+
+        PssVisualizer._saveResult(
+            detectResult=detectResult,
+            overlayPeak=overlayPeak,
+            scanSamples=scanSamples,
+            outputPrefix=outputPrefix,
+        )
 
     @staticmethod
-    def _saveResult(detectResult: dict, validGscnList: list):
-        """
-        将 PSS 盲搜结果保存为 JSON 文件
+    def _getPssLsqEstimation(detectResult: dict) -> dict | None:
+        estimation = detectResult.get("pssFreqOffsetEstimation")
+        if estimation is not None:
+            return estimation
+        selected = detectResult.get("freqOffsetEstimation")
+        if isinstance(selected, dict) and str(selected.get("method", "")) == "pss_phase_lsq":
+            return selected
+        return None
 
-        输出文件: output/pss_search_result.json
+    @staticmethod
+    def _getCpEstimation(detectResult: dict) -> dict | None:
+        estimation = detectResult.get("cpFreqOffsetEstimation")
+        if estimation is not None:
+            return estimation
+        selected = detectResult.get("freqOffsetEstimation")
+        if isinstance(selected, dict) and str(selected.get("method", "")) == "cp_phase":
+            return selected
+        return None
 
-        参数:
-            detectResult   : PSS 检测结果字典
-            validGscnList  : 候选频点列表
-        """
+    @staticmethod
+    def _plotPssFreqOffsetEstimation(detectResult: dict, outputPrefix: str = ""):
+        estimation = PssVisualizer._getPssLsqEstimation(detectResult)
+        if estimation is None:
+            return
+
+        sampleIndex = np.asarray(estimation.get("sampleIndex"))
+        phaseSamples = np.asarray(estimation.get("phaseSamplesRad"))
+        fittedPhase = np.asarray(estimation.get("fittedPhaseRad"))
+        residualPhase = np.asarray(estimation.get("residualPhaseRad"))
+        if len(sampleIndex) == 0:
+            return
+
+        fig = plt.figure(figsize=(14, 8))
+
+        axFit = plt.subplot(2, 1, 1)
+        axFit.scatter(sampleIndex, phaseSamples, s=8, alpha=0.55, color="tab:blue", label="Phase Samples")
+        axFit.plot(sampleIndex, fittedPhase, color="tab:red", linewidth=2.0, label="LS Fitted Line")
+        axFit.set_title(
+            "PSS-assisted CFO LS Fit | "
+            f"R^2={float(estimation.get('rSquared', 0.0)):.6f} | "
+            f"base={float(estimation.get('baseFreqHz', 0.0)):.3f} Hz | "
+            f"residual={float(estimation.get('residualFreqHz', 0.0)):.3f} Hz | "
+            f"refined={float(estimation.get('refinedFreqHz', 0.0)):.3f} Hz"
+        )
+        axFit.set_xlabel("Sample Index (within PSS symbol)")
+        axFit.set_ylabel("Unwrapped Phase (rad)")
+        axFit.grid(True, linestyle="--", alpha=0.5)
+        axFit.legend()
+
+        axResidual = plt.subplot(2, 1, 2)
+        axResidual.scatter(sampleIndex, residualPhase, s=8, alpha=0.65, color="tab:purple")
+        axResidual.axhline(0.0, color="black", linewidth=1.0, linestyle="--")
+        axResidual.set_title("LS Residual Scatter")
+        axResidual.set_xlabel("Sample Index (within PSS symbol)")
+        axResidual.set_ylabel("Residual Phase (rad)")
+        axResidual.grid(True, linestyle="--", alpha=0.5)
+
+        plt.tight_layout()
+
+        prefix = f"{outputPrefix}_" if outputPrefix else ""
+        imgPath = os.path.join(PssVisualizer.OutputDir, f"{prefix}pss_freq_offset_lsq.png")
+        fig.savefig(imgPath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"PSS CFO LS fit figure saved: {os.path.abspath(imgPath)}")
+
+    @staticmethod
+    def _plotCpFreqOffsetEstimation(detectResult: dict, outputPrefix: str = ""):
+        estimation = PssVisualizer._getCpEstimation(detectResult)
+        if estimation is None:
+            return
+
+        windowIndex = np.asarray(estimation.get("windowIndex"))
+        residualByWindow = np.asarray(estimation.get("residualFreqByWindowHz"))
+        coherence = np.asarray(estimation.get("coherence"))
+        pointIndex = np.asarray(estimation.get("pointIndex"))
+        pointPhase = np.asarray(estimation.get("pointPhaseRad"))
+        pointResidual = np.asarray(estimation.get("pointResidualHz"))
+        pointWindow = np.asarray(estimation.get("pointWindowIndex"))
+        pointWeight = np.asarray(estimation.get("pointWeight"))
+        if len(windowIndex) == 0 or len(residualByWindow) == 0:
+            return
+
+        fig = plt.figure(figsize=(14, 11))
+
+        axPhase = plt.subplot(3, 1, 1)
+        if len(pointIndex) > 0 and len(pointPhase) == len(pointIndex):
+            phaseSize = np.clip((pointWeight / (np.max(pointWeight) + 1e-12)) * 16.0, 3.0, 16.0)
+            scPhase = axPhase.scatter(
+                pointIndex,
+                pointPhase,
+                s=phaseSize,
+                c=pointWindow if len(pointWindow) == len(pointIndex) else "tab:blue",
+                cmap="tab10",
+                alpha=0.7,
+            )
+            if len(pointWindow) == len(pointIndex):
+                cbar = fig.colorbar(scPhase, ax=axPhase, pad=0.01)
+                cbar.set_label("Window Index")
+        axPhase.set_title("CP Point-wise Phase Difference Scatter")
+        axPhase.set_xlabel("Point Index (across CP windows)")
+        axPhase.set_ylabel("Phase Difference (rad)")
+        axPhase.grid(True, linestyle="--", alpha=0.5)
+
+        axFreq = plt.subplot(3, 1, 2)
+        if len(pointIndex) > 0 and len(pointResidual) == len(pointIndex):
+            freqSize = np.clip((pointWeight / (np.max(pointWeight) + 1e-12)) * 16.0, 3.0, 16.0)
+            scFreq = axFreq.scatter(
+                pointIndex,
+                pointResidual,
+                s=freqSize,
+                c=pointWindow if len(pointWindow) == len(pointIndex) else "tab:blue",
+                cmap="tab10",
+                alpha=0.7,
+            )
+            if len(pointWindow) == len(pointIndex):
+                cbar = fig.colorbar(scFreq, ax=axFreq, pad=0.01)
+                cbar.set_label("Window Index")
+        axFreq.plot(windowIndex * max(1, int(estimation.get("cpLength", 0))), residualByWindow, "k--", linewidth=1.2, label="Window CFO")
+        axFreq.axhline(
+            float(estimation.get("residualFreqHz", 0.0)),
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.5,
+            label="Weighted Mean",
+        )
+        axFreq.set_title(
+            "CP-based CFO Estimation | "
+            f"base={float(estimation.get('baseFreqHz', 0.0)):.3f} Hz | "
+            f"residual={float(estimation.get('residualFreqHz', 0.0)):.3f} Hz | "
+            f"refined={float(estimation.get('refinedFreqHz', 0.0)):.3f} Hz | "
+            f"std={float(estimation.get('residualStdHz', 0.0)):.3f} Hz"
+        )
+        axFreq.set_xlabel("Point Index (across CP windows)")
+        axFreq.set_ylabel("Residual CFO by point (Hz)")
+        axFreq.grid(True, linestyle="--", alpha=0.5)
+        axFreq.legend()
+
+        axCoh = plt.subplot(3, 1, 3)
+        axCoh.plot(windowIndex, coherence, "s-", color="tab:green", linewidth=1.5, markersize=5)
+        axCoh.set_ylim(0.0, 1.05)
+        axCoh.set_title("CP Correlation Coherence")
+        axCoh.set_xlabel("Window Index (SSB symbol order)")
+        axCoh.set_ylabel("Coherence [0, 1]")
+        axCoh.grid(True, linestyle="--", alpha=0.5)
+
+        plt.tight_layout()
+
+        prefix = f"{outputPrefix}_" if outputPrefix else ""
+        imgPath = os.path.join(PssVisualizer.OutputDir, f"{prefix}pss_freq_offset_cp.png")
+        fig.savefig(imgPath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"CP CFO figure saved: {os.path.abspath(imgPath)}")
+
+    @staticmethod
+    def _summarizeFreqOffsetEstimation(estimation: dict) -> dict:
+        method = str(estimation.get("method", "unknown"))
+        summary = {
+            "method": method,
+            "baseFreqHz": float(estimation.get("baseFreqHz", 0.0)),
+            "residualFreqHz": float(estimation.get("residualFreqHz", 0.0)),
+            "refinedFreqHz": float(estimation.get("refinedFreqHz", 0.0)),
+        }
+        if method == "pss_phase_lsq":
+            summary.update({
+                "usefulOnly": bool(estimation.get("usefulOnly", False)),
+                "slopeRadPerSample": float(estimation.get("slopeRadPerSample", 0.0)),
+                "interceptRad": float(estimation.get("interceptRad", 0.0)),
+                "rSquared": float(estimation.get("rSquared", 0.0)),
+                "sampleStart": int(estimation.get("sampleStart", 0)),
+                "sampleCount": int(estimation.get("sampleCount", 0)),
+                "validSampleCount": int(estimation.get("validSampleCount", 0)),
+            })
+        elif method == "cp_phase":
+            summary.update({
+                "fftSize": int(estimation.get("fftSize", 0)),
+                "cpLength": int(estimation.get("cpLength", 0)),
+                "symbolCountUsed": int(estimation.get("symbolCountUsed", 0)),
+                "residualStdHz": float(estimation.get("residualStdHz", 0.0)),
+                "pointCount": int(estimation.get("pointCount", 0)),
+            })
+        return summary
+
+    @staticmethod
+    def _saveResult(detectResult: dict, overlayPeak: dict, scanSamples: int, outputPrefix: str = ""):
         PssVisualizer._ensureOutputDir()
 
-        gscn = detectResult["gscn"]
-        freqOffset = detectResult["freqOffset"]
-        peakAnalysis = detectResult.get("peakAnalysis")
+        nId2ResultList = []
+        for item in detectResult.get("nId2BestResults", []):
+            nId2ResultList.append({
+                "nId2": int(item["nId2"]),
+                "gscn": int(item["gscn"]),
+                "freqOffsetHz": float(item["freqOffset"]),
+                "timingOffset": int(item["timingOffset"]),
+                "peakValue": float(item["peakValue"]),
+            })
 
         resultData = {
-            "检测结果": {
-                "GSCN":             gscn,
-                "SSREF绝对频率Hz":  freqOffset,
-                "SSREF绝对频率MHz": round(freqOffset / 1e6, 4),
-                "扇区ID_N_ID_2":    detectResult["nId2"],
-                "定时偏移采样点":    detectResult["timingOffset"],
-                "相关峰值幅度":      round(float(detectResult["peakValue"]), 6)
+            "scoreMode": str(detectResult.get("scoreMode", "raw")),
+            "finalBest": {
+                "nId2": int(detectResult["nId2"]),
+                "gscn": int(detectResult["gscn"]),
+                "freqOffsetHz": float(detectResult["freqOffset"]),
+                "freqOffsetParabolicHz": float(detectResult.get("freqOffsetParabolic", detectResult["freqOffset"])),
+                "timingOffset": int(detectResult["timingOffset"]),
+                "peakValue": float(detectResult["peakValue"]),
             },
-            "多峰分析": PssVisualizer._serializePeakAnalysis(peakAnalysis),
-            "搜索参数": {
-                "候选GSCN数量": len(validGscnList),
-                "GSCN范围":     f"{validGscnList[0][0]} ~ {validGscnList[-1][0]}"
-            }
+            "coarseBest": detectResult.get("coarseBest"),
+            "fineSearchConfig": detectResult.get("fineSearch"),
+            "nId2BestResults": nId2ResultList,
+            "overlayPeakInFirstSamples": {
+                "sampleCount": int(scanSamples),
+                "nId2": int(overlayPeak["nId2"]),
+                "sampleIndex": int(overlayPeak["sampleIndex"]),
+                "peakValue": float(overlayPeak["peakValue"]),
+            },
         }
+        parabolicRefinement = detectResult.get("parabolicRefinement")
+        if parabolicRefinement is not None:
+            resultData["parabolicRefinement"] = parabolicRefinement
+        adaptiveRefinement = detectResult.get("adaptiveRefinement")
+        if adaptiveRefinement is not None:
+            resultData["adaptiveRefinement"] = adaptiveRefinement
+        selectedEstimation = detectResult.get("freqOffsetEstimation")
+        if selectedEstimation is not None:
+            resultData["selectedFreqOffsetEstimation"] = PssVisualizer._summarizeFreqOffsetEstimation(selectedEstimation)
+            resultData["freqOffsetEstimation"] = resultData["selectedFreqOffsetEstimation"]
 
-        jsonPath = os.path.join(PssVisualizer.OutputDir, 'pss_search_result.json')
-        with open(jsonPath, 'w', encoding='utf-8') as f:
+        pssEstimation = detectResult.get("pssFreqOffsetEstimation")
+        if pssEstimation is not None:
+            resultData["pssFreqOffsetEstimation"] = PssVisualizer._summarizeFreqOffsetEstimation(pssEstimation)
+
+        cpEstimation = detectResult.get("cpFreqOffsetEstimation")
+        if cpEstimation is not None:
+            resultData["cpFreqOffsetEstimation"] = PssVisualizer._summarizeFreqOffsetEstimation(cpEstimation)
+
+        prefix = f"{outputPrefix}_" if outputPrefix else ""
+        jsonPath = os.path.join(PssVisualizer.OutputDir, f"{prefix}pss_search_result.json")
+        with open(jsonPath, "w", encoding="utf-8") as f:
             json.dump(resultData, f, ensure_ascii=False, indent=4)
 
-        logger.info(f"盲搜结果已保存: {os.path.abspath(jsonPath)}")
-        logger.info(f"  GSCN={gscn}, SSREF={freqOffset/1e6:.4f} MHz, "
-                    f"N_ID_2={detectResult['nId2']}, "
-                    f"TimingOffset={detectResult['timingOffset']}, "
-                    f"PeakValue={detectResult['peakValue']:.6f}")
-
-    @staticmethod
-    def _serializePeakAnalysis(peakAnalysis: dict) -> dict:
-        """
-        序列化多峰分析结果为 JSON 可存储格式
-
-        参数:
-            peakAnalysis: 多峰分析结果字典
-
-        返回:
-            JSON 可序列化的字典
-        """
-        if not peakAnalysis:
-            return None
-
-        result = {
-            "显著峰数量": peakAnalysis.get("peakCount", 0),
-            "显著峰列表": peakAnalysis.get("detectedPeaks", []),
-            "CP回波检测": None
-        }
-
-        cpPair = peakAnalysis.get("cpEchoPair")
-        if cpPair:
-            result["CP回波检测"] = {
-                "主峰位置":   cpPair["mainPeakIndex"],
-                "主峰幅度":   round(cpPair["mainPeakValue"], 6),
-                "主峰扇区ID": cpPair.get("mainPeakNId2", 0),
-                "回波峰位置": cpPair["cpEchoPeakIndex"],
-                "回波峰幅度": round(cpPair["cpEchoPeakValue"], 6),
-                "回波峰扇区ID": cpPair.get("cpEchoPeakNId2", 0),
-                "测量CP长度": cpPair["measuredCpLength"],
-                "预期CP长度": cpPair["expectedCpLength"],
-                "CP长度误差": cpPair["cpLengthError"]
-            }
-
-        return result
+        logger.info(f"PSS result JSON saved: {os.path.abspath(jsonPath)}")

@@ -14,9 +14,10 @@ class GscnConstants:
         StepNMidRange      : 3~24GHz 的 N 步进 1.44 MHz
         StepNHighRange     : >24GHz 的 N 步进 17.28 MHz
     """
-    # GSCN 范围边界
+    # GSCN 范围边界 (>3MHz)
     MaxGscnBelow3GHz = 7499
     MaxGscnBelow24GHz = 22255
+    MaxGscnBelow100GHz = 26639
     OffsetGscnMidRange = 7499       # 3GHz ~ 24.25GHz 的 GSCN 偏移量
     OffsetGscnHighRange = 22256     # > 24.25GHz 的 GSCN 偏移量
 
@@ -29,6 +30,19 @@ class GscnConstants:
     StepMLowRange = 50e3            # < 3GHz 的 M 步进 (50 kHz)
     StepNMidRange = 1.44e6          # 3 ~ 24GHz 的 N 步进 (1.44 MHz)
     StepNHighRange = 17.28e6        # > 24GHz 的 N 步进 (17.28 MHz)
+
+    # 3MHz 专用 GSCN (TS 38.101-1 Table 5.4.3.1-2 / 5.4.3.1-3)
+    OffsetGscn3MHz = 26638
+    MinGscn3MHz = 26640
+    MaxGscn3MHz = 31634
+    MinGscn3MHzExtended = 33802
+    MaxGscn3MHzExtended = 33804
+    StepN3MHz = 600e3
+    Offset3MHz = 300e3
+    AdditionalGscnN100 = {
+        41637: 920.73e6,
+        41638: 921.45e6,
+    }
 
 
 class GscnRaster:
@@ -52,6 +66,15 @@ class GscnRaster:
         返回:
             SSREF 绝对频率 (Hz)
         """
+        # 3MHz channel raster specific entries
+        if gscn in GscnConstants.AdditionalGscnN100:
+            return GscnConstants.AdditionalGscnN100[gscn]
+
+        if GscnConstants.MinGscn3MHz <= gscn <= GscnConstants.MaxGscn3MHz or \
+                GscnConstants.MinGscn3MHzExtended <= gscn <= GscnConstants.MaxGscn3MHzExtended:
+            return GscnRaster._getAbsoluteFrequencyFor3MHz(gscn)
+
+        # >3MHz global raster entries
         if gscn <= GscnConstants.MaxGscnBelow3GHz:
             # 频段 0 ~ 3000MHz
             # F_SSB = N × 1.2MHz + M × 50kHz
@@ -73,7 +96,30 @@ class GscnRaster:
             n = gscn - GscnConstants.OffsetGscnMidRange
             return GscnConstants.BaseFreqMidRange + n * GscnConstants.StepNMidRange
 
-        else:
+        elif gscn <= GscnConstants.MaxGscnBelow100GHz:
             # 频段 > 24250.08MHz
             n = gscn - GscnConstants.OffsetGscnHighRange
             return GscnConstants.BaseFreqHighRange + n * GscnConstants.StepNHighRange
+
+        raise ValueError(f"Unsupported GSCN value: {gscn}")
+
+    @staticmethod
+    def _getAbsoluteFrequencyFor3MHz(gscn: int) -> float:
+        """
+        3MHz channel bandwidth 专用 GSCN 频率映射 (TS 38.101-1 Table 5.4.3.1-2)
+
+        SSREF = N*600k + M*50k + 300k
+        GSCN  = 26638 + 3N + (M-3)/2, M∈{1,3,5}
+        """
+        candidates = (
+            (1, 26637),  # M=1 => gscn = 26637 + 3N
+            (3, 26638),  # M=3 => gscn = 26638 + 3N
+            (5, 26639),  # M=5 => gscn = 26639 + 3N
+        )
+        for m, offset in candidates:
+            delta = gscn - offset
+            if delta % 3 == 0:
+                n = delta // 3
+                if n >= 1:
+                    return n * GscnConstants.StepN3MHz + m * GscnConstants.StepMLowRange + GscnConstants.Offset3MHz
+        raise ValueError(f"Invalid 3MHz GSCN value: {gscn}")

@@ -29,7 +29,7 @@ class CpManager:
         # =================================================================
         # 长 CP 长度: 由时隙总采样数反推
         #
-        # 时隙时长 = 0.5ms (对于 μ=0) 或 0.5ms / 2^μ (对于 μ>0)
+        # 正常 CP 下的时隙时长为 1ms / 2^μ
         # 其中 μ = log2(SCS / 15kHz)
         #
         # 时隙总采样数 = fs × 时隙时长
@@ -40,7 +40,7 @@ class CpManager:
         mu = int(np.log2(self.config.SubcarrierSpacing / 15000))
 
         # 时隙时长 (秒)
-        slotDuration = 0.5e-3 / (2 ** mu)
+        slotDuration = 1e-3 / (2 ** mu)
 
         # 时隙总采样数
         totalSamplesPerSlot = int(self.config.SampleRate * slotDuration)
