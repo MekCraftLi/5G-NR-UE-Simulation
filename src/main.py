@@ -1,21 +1,21 @@
 import argparse
 import json
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from common.bandwidthEstimator import detectBandwidth, inferScs
 from common.config import createSsbConfig
 from common.cpManager import CpManager
-from common.gscn import GscnRaster
-from common.gscnRasterTable import buildGscnMatrix, findCasesByGscn
+from pss.pssBasebandSearcher import PssBasebandSearcher
 from pss.cpFreqOffsetEstimator import CpFreqOffsetEstimator
-from pss.pssDetector import PssDetector
 from pss.pssFreqOffsetEstimator import PssFreqOffsetEstimator
+from pss.pssTemplateFactory import generatePssSequence
 from pss.pssVisualizer import PssVisualizer
+from pss.scsDetectVisualizer import plotScsDetection
 from sss.sssDetector import SssDetector
 from sss.sssVisualizer import SssVisualizer
 
@@ -35,6 +35,10 @@ class RuntimeConfig:
     pssScoreMode: str = "raw"
     pssAdaptiveIterations: int = 5
     pssLsqMinR2: float = 0.8
+    pssCoarseStepHz: float = 1000.0
+    pssMediumStepHz: float = 100.0
+    pssFineStepHz: float = 15.0
+    pssUseGpu: bool = True
     sssEnable: bool = True
     pssOnly: bool = False
     sssSearchStartSymbol: float = 0.5
@@ -80,6 +84,32 @@ def _parseArgs(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=None,
         help="Minimum R^2 to accept PSS-assisted CFO LS fit",
+    )
+    parser.add_argument(
+        "--pss-coarse-step",
+        type=float,
+        default=None,
+        help="PSS adaptive search coarse step (Hz), default 1000",
+    )
+    parser.add_argument(
+        "--pss-medium-step",
+        type=float,
+        default=None,
+        help="PSS adaptive search medium step (Hz), default 100",
+    )
+    parser.add_argument(
+        "--pss-fine-step",
+        type=float,
+        default=None,
+        help="PSS adaptive search fine step (Hz), default 15",
+    )
+    parser.add_argument(
+        "--use-gpu", action="store_true", default=None,
+        help="Use GPU for PSS search (default: auto-detect)",
+    )
+    parser.add_argument(
+        "--no-gpu", action="store_true", default=None,
+        help="Force CPU for PSS search",
     )
     parser.add_argument(
         "--disable-sss",
@@ -170,6 +200,10 @@ def _buildRuntimeConfig(args: argparse.Namespace) -> RuntimeConfig:
         "pssScoreMode": "raw",
         "pssAdaptiveIterations": 5,
         "pssLsqMinR2": 0.8,
+        "pssCoarseStepHz": 1000.0,
+        "pssMediumStepHz": 100.0,
+        "pssFineStepHz": 15.0,
+        "pssUseGpu": True,
         "sssEnable": True,
         "pssOnly": False,
         "sssSearchStartSymbol": 0.5,
@@ -239,6 +273,28 @@ def _buildRuntimeConfig(args: argparse.Namespace) -> RuntimeConfig:
         if args.pss_lsq_min_r2 is not None
         else _pick(fileCfg, "pss_lsq_min_r2", "pssLsqMinR2", default=defaults["pssLsqMinR2"])
     )
+    pssCoarseStepHz = float(
+        args.pss_coarse_step
+        if args.pss_coarse_step is not None
+        else _pick(fileCfg, "pss_coarse_step_hz", "pssCoarseStepHz", default=defaults["pssCoarseStepHz"])
+    )
+    pssMediumStepHz = float(
+        args.pss_medium_step
+        if args.pss_medium_step is not None
+        else _pick(fileCfg, "pss_medium_step_hz", "pssMediumStepHz", default=defaults["pssMediumStepHz"])
+    )
+    pssFineStepHz = float(
+        args.pss_fine_step
+        if args.pss_fine_step is not None
+        else _pick(fileCfg, "pss_fine_step_hz", "pssFineStepHz", default=defaults["pssFineStepHz"])
+    )
+    pssUseGpu = bool(
+        _pick(fileCfg, "pss_use_gpu", "pssUseGpu", default=defaults["pssUseGpu"])
+    )
+    if args.use_gpu:
+        pssUseGpu = True
+    if args.no_gpu:
+        pssUseGpu = False
     sssEnableCfg = _pick(fileCfg, "sss_enable", "sssEnable", default=defaults["sssEnable"])
     sssEnable = bool(sssEnableCfg)
     if args.disable_sss:
@@ -304,6 +360,14 @@ def _buildRuntimeConfig(args: argparse.Namespace) -> RuntimeConfig:
         raise ValueError("pssAdaptiveIterations must be >= 0")
     if pssLsqMinR2 < 0.0 or pssLsqMinR2 > 1.0:
         raise ValueError("pssLsqMinR2 must be in [0, 1]")
+    if pssCoarseStepHz <= 0:
+        raise ValueError("pssCoarseStepHz must be > 0")
+    if pssMediumStepHz <= 0:
+        raise ValueError("pssMediumStepHz must be > 0")
+    if pssFineStepHz <= 0:
+        raise ValueError("pssFineStepHz must be > 0")
+    if not (pssFineStepHz < pssMediumStepHz < pssCoarseStepHz):
+        raise ValueError("step sizes must satisfy: fine < medium < coarse")
     if sssSearchEndSymbol <= sssSearchStartSymbol:
         raise ValueError("sssSearchEndSymbol must be > sssSearchStartSymbol")
     if sssSearchStepSamples <= 0:
@@ -324,6 +388,10 @@ def _buildRuntimeConfig(args: argparse.Namespace) -> RuntimeConfig:
         pssScoreMode=pssScoreMode,
         pssAdaptiveIterations=pssAdaptiveIterations,
         pssLsqMinR2=pssLsqMinR2,
+        pssCoarseStepHz=pssCoarseStepHz,
+        pssMediumStepHz=pssMediumStepHz,
+        pssFineStepHz=pssFineStepHz,
+        pssUseGpu=pssUseGpu,
         sssEnable=sssEnable,
         pssOnly=pssOnly,
         sssSearchStartSymbol=sssSearchStartSymbol,
@@ -373,6 +441,8 @@ def main(argv: list[str] | None = None):
         f"pssWorkers={cfg.pssWorkers}, pssParallelMode={cfg.pssParallelMode}, "
         f"pssScoreMode={cfg.pssScoreMode}, pssAdaptiveIterations={cfg.pssAdaptiveIterations}, "
         f"pssLsqMinR2={cfg.pssLsqMinR2}, "
+        f"pssCoarseStepHz={cfg.pssCoarseStepHz}, pssMediumStepHz={cfg.pssMediumStepHz}, "
+        f"pssFineStepHz={cfg.pssFineStepHz}, pssUseGpu={cfg.pssUseGpu}, "
         f"sssEnable={cfg.sssEnable}, pssOnly={cfg.pssOnly}, sssSearchStartSymbol={cfg.sssSearchStartSymbol}, "
         f"sssSearchEndSymbol={cfg.sssSearchEndSymbol}, sssSearchStepSamples={cfg.sssSearchStepSamples}, "
         f"progressMode={cfg.progressMode}, progressRefreshSec={cfg.progressRefreshSec}"
@@ -391,138 +461,175 @@ def main(argv: list[str] | None = None):
     cpManager = CpManager(ssbConfig)
     logger.info(f"FFT: {ssbConfig.FftSize}, NormalCP: {ssbConfig.NormalCpLength}, LongCP: {cpManager.longCpLength}")
 
-    logger.info("3) Build GSCN matrix from PRB+SCS")
-    try:
-        validGscnList, rasterEntries, meta = buildGscnMatrix(prbCount=cfg.prbCount, scsHz=cfg.scs)
-    except ValueError as e:
-        logger.error(str(e))
-        return
+    logger.info("3) Detect SCS and signal bandwidth via CP autocorrelation")
+    bwEstimate = detectBandwidth(rxSignal, cfg.sampleRate)
+    scsCandidates = inferScs(bwEstimate)
 
-    logger.info(f"Occupied bandwidth: {meta['occupiedBandwidthMHz']:.3f} MHz")
-    if meta["inferredChannelBandwidthMHz"] is not None:
-        logger.info(f"Inferred channel bandwidth: {meta['inferredChannelBandwidthMHz']:.1f} MHz")
-    else:
-        logger.info("Inferred channel bandwidth: Unknown (fallback to occupied-bandwidth threshold)")
-    logger.info(f"GSCN table: {'Table 5.4.3.3-2 (3MHz)' if meta['bandwidthClass'] == 'bw3mhz' else 'Table 5.4.3.3-1 (>3MHz)'}")
-    logger.info(f"SCS cases: {', '.join(meta['caseSet'])}")
-    logger.info(f"GSCN candidates: {len(validGscnList)}")
-    logger.info(f"GSCN range: {validGscnList[0][0]} ~ {validGscnList[-1][0]}")
+    detectedScs = bwEstimate.scsHz
+    scsMatch = (int(cfg.scs) == int(detectedScs))
+    # 搜索范围: SSB 带宽 = 240 子载波 × SCS
+    freqMinHz = -bwEstimate.bandwidthHz / 2
+    freqMaxHz = +bwEstimate.bandwidthHz / 2
+
     logger.info(
-        f"Absolute frequency range: {validGscnList[0][1] / 1e6:.3f} MHz ~ {validGscnList[-1][1] / 1e6:.3f} MHz"
+        f"Detected: SCS={detectedScs/1000:.0f}kHz, FFT={bwEstimate.fftSize}, "
+        f"CP={bwEstimate.cpLength}, SSB BW={bwEstimate.bandwidthHz/1e6:.3f}MHz, "
+        f"confidence={bwEstimate.confidence:.2f}"
     )
+    logger.info(f"Search range: [{freqMinHz/1e6:.3f}, {freqMaxHz/1e6:.3f}] MHz")
 
-    logger.info("4) Run PSS blind search")
-    pssDetector = PssDetector(
-        ssbConfig,
-        scoreMode=cfg.pssScoreMode,
-        adaptiveRefineIterations=cfg.pssAdaptiveIterations,
-        maxWorkers=cfg.pssWorkers,
-        parallelMode=cfg.pssParallelMode,
-        progressMode=cfg.progressMode,
-        progressRefreshSec=cfg.progressRefreshSec,
+    def _richWarn(title, body, style="yellow"):
+        try:
+            from rich.console import Console
+            from rich.panel import Panel
+            Console(stderr=True).print(Panel.fit(body, title=title, border_style=style))
+        except ImportError:
+            logger.warning(f"{title}: {body}")
+
+    if bwEstimate.confidence < 0.5:
+        _richWarn(
+            "SCS Detection",
+            f"[dim]CP 自相关置信度仅 {bwEstimate.confidence:.2f}，"
+            f"SCS 推断可能不准确[/dim]\n"
+            f"检测值: SCS={detectedScs/1000:.0f}kHz, "
+            f"SSB BW={bwEstimate.bandwidthHz/1e6:.2f}MHz"
+        )
+
+    if not scsMatch:
+        _richWarn(
+            "SCS Validation",
+            f"检测 SCS: [bold green]{detectedScs/1000:.0f} kHz[/bold green] "
+            f"(SSB BW={bwEstimate.bandwidthHz/1e6:.2f} MHz)\n"
+            f"指定 SCS: [bold red]{cfg.scs/1000:.0f} kHz[/bold red] "
+            f"— [bold yellow]不匹配![/bold yellow]",
+        )
+    else:
+        logger.info(f"SCS {cfg.scs/1000:.0f}kHz: matches detected SCS")
+
+    plotScsDetection(rxSignal, cfg.sampleRate, outputPrefix=cfg.outputPrefix)
+
+    logger.info("4) Run PSS adaptive baseband frequency search")
+    pssSearcher = PssBasebandSearcher(
+        config=ssbConfig,
+        freqMinHz=freqMinHz,
+        freqMaxHz=freqMaxHz,
+        workers=cfg.pssWorkers,
+        useGpu=cfg.pssUseGpu,
     )
-    pssResult = pssDetector.detectPss(rxSignal, validGscnList)
+    pssResult = pssSearcher.searchAdaptive(
+        signal=rxSignal,
+        coarseStepHz=cfg.pssCoarseStepHz,
+        mediumStepHz=cfg.pssMediumStepHz,
+        fineStepHz=cfg.pssFineStepHz,
+        subfineIterations=cfg.pssAdaptiveIterations,
+    )
     baseFreqForEstHz = float(pssResult.get("freqOffsetParabolic", pssResult["freqOffset"]))
-    pssFreqEstimator = PssFreqOffsetEstimator(ssbConfig)
-    pssLsqEstimation = pssFreqEstimator.estimate(
+
+    # ── 论文 FFO 估计 (Tuninato 2023, Eq 15-17): PSS 半符号相关 ──
+    nId2 = int(pssResult["nId2"])
+    timingOffset = int(pssResult["timingOffset"])
+    fftSize = int(ssbConfig.FftSize)
+    cpLen = int(ssbConfig.NormalCpLength)
+    halfLen = fftSize // 2
+    sampleRate = float(ssbConfig.SampleRate)
+
+    pssSeq = generatePssSequence(nId2)
+    pssFreq = np.zeros(fftSize, dtype=np.complex64)
+    pssFreq[fftSize // 2 - 63:fftSize // 2 + 64] = pssSeq
+    pssTimeTemplate = np.fft.ifft(np.fft.ifftshift(pssFreq)).astype(np.complex64)
+    pssTimeTemplate /= np.linalg.norm(pssTimeTemplate)
+
+    usefulStart = timingOffset + cpLen
+    globalIdx = np.arange(usefulStart, usefulStart + fftSize, dtype=np.float64)
+    phase = np.exp(-1j * 2.0 * np.pi * baseFreqForEstHz * globalIdx / sampleRate).astype(np.complex64)
+    pssRx = (np.asarray(rxSignal[usefulStart:usefulStart + fftSize], dtype=np.complex64) * phase).astype(np.complex64)
+
+    C0 = np.vdot(pssRx[:halfLen], pssTimeTemplate[:halfLen])
+    C1 = np.vdot(pssRx[halfLen:], pssTimeTemplate[halfLen:])
+    deltaTheta = float(np.angle(C1 * np.conjugate(C0)))
+    ffoHz = deltaTheta * sampleRate / (np.pi * fftSize)
+    totalCfoHz = baseFreqForEstHz + ffoHz
+
+    pssFfoResult = {
+        "method": "pss_half_symbol_ffo",
+        "C0": complex(C0),
+        "C1": complex(C1),
+        "deltaThetaRad": deltaTheta,
+        "ffoHz": ffoHz,
+        "totalCfoHz": totalCfoHz,
+        "baseFreqHz": baseFreqForEstHz,
+    }
+    pssResult["pssFfoEstimation"] = pssFfoResult
+
+    # ── PSS LS 相位拟合: 频偏精估 + R² 质量指标 ──
+    lsEstimator = PssFreqOffsetEstimator(ssbConfig)
+    lsResult = lsEstimator.estimate(
         rxSignal=rxSignal,
-        nId2=int(pssResult["nId2"]),
-        timingOffset=int(pssResult["timingOffset"]),
+        nId2=nId2,
+        timingOffset=timingOffset,
         baseFreqHz=baseFreqForEstHz,
     )
-    if pssLsqEstimation is not None:
-        pssResult["pssFreqOffsetEstimation"] = pssLsqEstimation
+    if lsResult is not None:
+        pssResult["pssFreqOffsetEstimation"] = lsResult
 
-    cpFreqEstimator = CpFreqOffsetEstimator(ssbConfig)
-    cpEstimation = cpFreqEstimator.estimate(
+    # ── CP 相位频偏估计 ──
+    cpEstimator = CpFreqOffsetEstimator(ssbConfig)
+    cpResult = cpEstimator.estimate(
         rxSignal=rxSignal,
-        timingOffset=int(pssResult["timingOffset"]),
+        timingOffset=timingOffset,
         baseFreqHz=baseFreqForEstHz,
     )
-    if cpEstimation is not None:
-        pssResult["cpFreqOffsetEstimation"] = cpEstimation
-
-    selectedEstimation = None
-    useCpFallback = True
-    if pssLsqEstimation is not None:
-        rSquared = float(pssLsqEstimation.get("rSquared", 0.0))
-        useCpFallback = rSquared < float(cfg.pssLsqMinR2)
-    if useCpFallback and cpEstimation is not None:
-        selectedEstimation = cpEstimation
-    elif pssLsqEstimation is not None:
-        selectedEstimation = pssLsqEstimation
-    elif cpEstimation is not None:
-        selectedEstimation = cpEstimation
-
-    if selectedEstimation is not None:
-        pssResult["freqOffsetEstimation"] = selectedEstimation
-
-    bestGscn = int(pssResult["gscn"])
-    bestAbsFreqHz = GscnRaster.getAbsoluteFrequency(bestGscn)
-    bestCase = findCasesByGscn(bestGscn, rasterEntries)
+    if cpResult is not None:
+        pssResult["cpFreqOffsetEstimation"] = cpResult
+    else:
+        logger.warning("CP frequency offset estimation returned None (no valid CP windows)")
 
     logger.info("5) Search result")
-    logger.info(f"  Best GSCN: {bestGscn}")
-    logger.info(f"  Best case: {bestCase}")
-    logger.info(f"  Absolute frequency by GSCN: {bestAbsFreqHz / 1e6:.6f} MHz")
-    logger.info(f"  Fine-search best offset (relative to DC): {pssResult['freqOffset'] / 1e6:.6f} MHz")
-    if "freqOffsetParabolic" in pssResult:
-        logger.info(f"  Parabolic-interp offset (relative to DC): {pssResult['freqOffsetParabolic'] / 1e6:.6f} MHz")
-    adaptiveRefinement = pssResult.get("adaptiveRefinement")
-    if adaptiveRefinement is not None:
+    logger.info(f"  Mode: adaptive baseband (no GSCN)")
+    logger.info(f"  Best baseband frequency: {pssResult['freqOffsetParabolic'] / 1e3:.3f} kHz")
+    freqSearch = pssResult.get("freqSearch", {})
+    if isinstance(freqSearch, dict):
+        for name in ["coarse", "medium", "fine"]:
+            p = freqSearch.get("passes", {}).get(name, {})
+            if p:
+                logger.info(
+                    f"  {name}: step={p.get('stepHz', 0):.0f} Hz, "
+                    f"bestFreq={p.get('bestFreqHz', 0) / 1e3:.3f} kHz, "
+                    f"bestNId2={p.get('bestNId2', '?')}"
+                )
+    ar = pssResult.get("adaptiveRefinement", {})
+    if ar:
         logger.info(
-            "  Adaptive refinement: "
-            f"maxIters={adaptiveRefinement.get('maxIterations', 0)}, "
-            f"validIters={adaptiveRefinement.get('finalValidIterations', 0)}, "
-            f"status={adaptiveRefinement.get('finalStatus', 'unknown')}"
+            f"  Sub-fine: iters={ar.get('finalValidIterations', 0)}/{ar.get('maxIterations', 0)}, "
+            f"status={ar.get('finalStatus', '?')}"
         )
     logger.info(f"  Best N_ID_2: {pssResult['nId2']}")
     logger.info(f"  Best timing offset: {pssResult['timingOffset']}")
     logger.info(f"  Peak value: {pssResult['peakValue']:.6f}")
-    if pssLsqEstimation is not None:
+    logger.info(
+        f"  Half-symbol FFO: C0={np.abs(C0):.0f}, C1={np.abs(C1):.0f}, "
+        f"Δθ={np.degrees(deltaTheta):.2f}°, "
+        f"FFO={ffoHz:.2f} Hz, totalCFO={totalCfoHz:.2f} Hz"
+    )
+    if lsResult is not None:
         logger.info(
-            "  PSS-assisted CFO LS fit: "
-            f"base={pssLsqEstimation['baseFreqHz']:.3f} Hz, "
-            f"residual={pssLsqEstimation['residualFreqHz']:.3f} Hz, "
-            f"refined={pssLsqEstimation['refinedFreqHz']:.3f} Hz, "
-            f"R2={pssLsqEstimation['rSquared']:.6f}"
+            f"  LS phase fit: R²={lsResult['rSquared']:.6f}, "
+            f"residual={lsResult['residualFreqHz']:.2f} Hz, "
+            f"refined={lsResult['refinedFreqHz']:.2f} Hz, "
+            f"validPts={lsResult['validSampleCount']}/{lsResult['sampleCount']}"
         )
-        if float(pssLsqEstimation["rSquared"]) < float(cfg.pssLsqMinR2):
-            logger.info(
-                f"  PSS-assisted CFO LS rejected (R2={pssLsqEstimation['rSquared']:.6f} < {cfg.pssLsqMinR2:.3f}); fallback to CP."
-            )
-
-    selectedEstimation = pssResult.get("freqOffsetEstimation")
-    if selectedEstimation is not None:
-        method = str(selectedEstimation.get("method", "unknown"))
-        if method == "cp_phase":
-            logger.info(
-                "  Selected CFO estimation (CP): "
-                f"base={selectedEstimation['baseFreqHz']:.3f} Hz, "
-                f"residual={selectedEstimation['residualFreqHz']:.3f} Hz, "
-                f"refined={selectedEstimation['refinedFreqHz']:.3f} Hz, "
-                f"std={selectedEstimation.get('residualStdHz', 0.0):.3f} Hz, "
-                f"windows={selectedEstimation.get('symbolCountUsed', 0)}"
-            )
-        else:
-            logger.info(
-                "  Selected CFO estimation (PSS-LS): "
-                f"base={selectedEstimation['baseFreqHz']:.3f} Hz, "
-                f"residual={selectedEstimation['residualFreqHz']:.3f} Hz, "
-                f"refined={selectedEstimation['refinedFreqHz']:.3f} Hz, "
-                f"R2={selectedEstimation.get('rSquared', 0.0):.6f}"
-            )
-    else:
+    if cpResult is not None:
         logger.info(
-            "  Selected CFO estimation: unavailable (both PSS-LS and CP estimation failed)."
+            f"  CP phase: residual={cpResult['residualFreqHz']:.2f} Hz, "
+            f"std={cpResult['residualStdHz']:.2f} Hz, "
+            f"windows={cpResult['symbolCountUsed']}, "
+            f"coherence={np.mean(cpResult['coherence']):.3f}"
         )
 
     sssResult = None
+    sssCompFreqHz = totalCfoHz
     if cfg.sssEnable:
         logger.info("6) Run SSS sliding search")
-        sssCompFreqHz = baseFreqForEstHz
-        if selectedEstimation is not None and "refinedFreqHz" in selectedEstimation:
-            sssCompFreqHz = float(selectedEstimation["refinedFreqHz"])
         sssDetector = SssDetector(ssbConfig)
         try:
             sssResult = sssDetector.detectSss(
@@ -545,7 +652,7 @@ def main(argv: list[str] | None = None):
     logger.info("7) Save plots and result json")
     PssVisualizer.plotPssSearchValidation(
         pssResult,
-        validGscnList,
+        [],  # validGscnList (unused, kept for API compatibility)
         len(rxSignal),
         outputPrefix=cfg.outputPrefix,
     )

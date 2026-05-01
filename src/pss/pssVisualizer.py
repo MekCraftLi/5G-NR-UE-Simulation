@@ -115,6 +115,7 @@ class PssVisualizer:
 
         PssVisualizer._plotPssFreqOffsetEstimation(detectResult, outputPrefix=outputPrefix)
         PssVisualizer._plotCpFreqOffsetEstimation(detectResult, outputPrefix=outputPrefix)
+        PssVisualizer._plotFreqScanHeatmap(detectResult, outputPrefix=outputPrefix)
 
         PssVisualizer._saveResult(
             detectResult=detectResult,
@@ -147,6 +148,7 @@ class PssVisualizer:
     def _plotPssFreqOffsetEstimation(detectResult: dict, outputPrefix: str = ""):
         estimation = PssVisualizer._getPssLsqEstimation(detectResult)
         if estimation is None:
+            logger.info("PSS LS figure skipped: no pssFreqOffsetEstimation in result")
             return
 
         sampleIndex = np.asarray(estimation.get("sampleIndex"))
@@ -193,6 +195,7 @@ class PssVisualizer:
     def _plotCpFreqOffsetEstimation(detectResult: dict, outputPrefix: str = ""):
         estimation = PssVisualizer._getCpEstimation(detectResult)
         if estimation is None:
+            logger.info("CP CFO figure skipped: no cpFreqOffsetEstimation in result")
             return
 
         windowIndex = np.asarray(estimation.get("windowIndex"))
@@ -305,6 +308,93 @@ class PssVisualizer:
                 "pointCount": int(estimation.get("pointCount", 0)),
             })
         return summary
+
+    @staticmethod
+    def _plotFreqScanHeatmap(detectResult: dict, outputPrefix: str = ""):
+        """频率扫描热力图: 三个 N_ID_2 在各频点的相关峰值"""
+        allPeaks = detectResult.get("allPassPeaks")
+        if allPeaks is None or len(allPeaks) == 0:
+            logger.info("Frequency scan heatmap skipped: no allPassPeaks data")
+            return
+
+        # 按 N_ID_2 分组: {nId2: {freqHz: peakValue}}
+        freqPeaks = {0: {}, 1: {}, 2: {}}
+        for item in allPeaks:
+            freqHz, nId2, peakValue, _ = item
+            nid = int(nId2)
+            f = float(freqHz)
+            v = float(peakValue)
+            if f not in freqPeaks[nid] or v > freqPeaks[nid][f]:
+                freqPeaks[nid][f] = v
+
+        colors = {0: "#1f77b4", 1: "#ff7f0e", 2: "#2ca02c"}
+        labels = {0: "N_ID_2=0", 1: "N_ID_2=1", 2: "N_ID_2=2"}
+
+        PssVisualizer._ensureOutputDir()
+        prefix = f"{outputPrefix}_" if outputPrefix else ""
+
+        # ── 叠加图 ──
+        fig, ax = plt.subplots(figsize=(16, 6))
+        for nid in range(3):
+            if not freqPeaks[nid]:
+                continue
+            freqs = np.array(sorted(freqPeaks[nid].keys()))
+            peaks = np.array([freqPeaks[nid][f] for f in freqs])
+            ax.plot(freqs / 1e3, peaks, color=colors[nid], linewidth=0.8,
+                    alpha=0.85, marker=".", markersize=3, label=labels[nid])
+
+        # 标注全局最佳
+        bestNid = int(detectResult.get("nId2", 0))
+        bestFreq = float(detectResult.get("freqOffsetParabolic", detectResult.get("freqOffset", 0)))
+        bestPeak = float(detectResult.get("peakValue", 0))
+        ax.axvline(bestFreq / 1e3, color="red", linestyle="--", linewidth=1.2,
+                   label=f"Best: {bestFreq/1e3:.3f} kHz (N_ID_2={bestNid}, peak={bestPeak:.1f})")
+        ax.set_title("PSS Correlation Peak vs Frequency (all passes)")
+        ax.set_xlabel("Frequency (kHz)")
+        ax.set_ylabel("Peak Correlation")
+        ax.legend(loc="upper right")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        imgPath = os.path.join(PssVisualizer.OutputDir, f"{prefix}pss_freq_scan_heatmap.png")
+        fig.savefig(imgPath, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        logger.info(f"Frequency scan heatmap saved: {os.path.abspath(imgPath)}")
+
+        # ── 分 N_ID_2 独立图 ──
+        for nid in range(3):
+            if not freqPeaks[nid]:
+                continue
+            freqs = np.array(sorted(freqPeaks[nid].keys()))
+            peaks = np.array([freqPeaks[nid][f] for f in freqs])
+
+            fig, ax = plt.subplots(figsize=(14, 5))
+            ax.plot(freqs / 1e3, peaks, color=colors[nid], linewidth=0.8,
+                    marker=".", markersize=4, alpha=0.85)
+            bestForNid = freqs[np.argmax(peaks)]
+            bestVal = np.max(peaks)
+            ax.axvline(bestForNid / 1e3, color="red", linestyle="--", linewidth=1.0,
+                       label=f"Best: {bestForNid/1e3:.3f} kHz (peak={bestVal:.1f})")
+
+            # 标注频段来源
+            freqSearch = detectResult.get("freqSearch", {})
+            passes = freqSearch.get("passes", {}) if isinstance(freqSearch, dict) else {}
+            for pname, color in [("coarse", "gray"), ("medium", "orange"), ("fine", "green")]:
+                p = passes.get(pname, {})
+                if p:
+                    bf = p.get("bestFreqHz", 0)
+                    ax.axvline(bf / 1e3, color=color, linestyle=":", linewidth=0.8, alpha=0.6,
+                               label=f"{pname}: {bf/1e3:.1f} kHz")
+
+            ax.set_title(f"{labels[nid]} — Frequency Scan")
+            ax.set_xlabel("Frequency (kHz)")
+            ax.set_ylabel("Peak Correlation")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+            plt.tight_layout()
+            imgPath = os.path.join(PssVisualizer.OutputDir, f"{prefix}pss_freq_scan_nid2_{nid}.png")
+            fig.savefig(imgPath, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"N_ID_2={nid} freq scan saved: {os.path.abspath(imgPath)}")
 
     @staticmethod
     def _saveResult(detectResult: dict, overlayPeak: dict, scanSamples: int, outputPrefix: str = ""):
