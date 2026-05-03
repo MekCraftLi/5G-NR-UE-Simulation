@@ -125,6 +125,12 @@ class PbchDecoder:
             idx = [i for i, item in enumerate(dmrsItems) if item.l == l]
             k = np.asarray([dmrsItems[i].k for i in idx], dtype=np.float64)
             h = np.asarray([hDmrs[i] for i in idx], dtype=np.complex64)
+            if len(h) >= 5:
+                # Smooth DMRS channel estimates per symbol to reduce interpolation noise.
+                kernel = np.asarray([1.0, 2.0, 3.0, 2.0, 1.0], dtype=np.float32)
+                kernel = kernel / np.sum(kernel)
+                hPad = np.pad(h, (2, 2), mode="edge")
+                h = np.convolve(hPad, kernel.astype(np.complex64), mode="valid").astype(np.complex64)
             order = np.argsort(k)
             hBySymbol[l] = (k[order], h[order])
 
