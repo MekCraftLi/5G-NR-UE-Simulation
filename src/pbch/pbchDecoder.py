@@ -94,8 +94,8 @@ class PbchDecoder:
         normal = int(self.cpManager.normalCpLength)
         long = int(self.cpManager.longCpLength)
         profiles: list[tuple[str, list[int]]] = [
-            ("slot_head", [long, normal, normal, normal]),
             ("all_normal", [normal, normal, normal, normal]),
+            ("slot_head", [long, normal, normal, normal]),
         ]
         return profiles
 
@@ -321,6 +321,44 @@ class PbchDecoder:
                 candidates.append(summary)
                 if item["evmPercent"] < best["evmPercent"]:
                     best = item
+
+        if best is not None:
+            cpProfileName = str(best.get("cpProfile", "all_normal"))
+            cpProfileMap = {name: vals for name, vals in cpProfiles}
+            cpLengths = [int(v) for v in cpProfileMap.get(cpProfileName, self._cpLengths())]
+            startCenter = int(best["ssbStart"])
+            startGrid = np.arange(startCenter - 16, startCenter + 16 + 1, dtype=np.int32)
+            step = max(1.0, float(residualFreqStepHz) / 10.0)
+            freqCenter = float(best["freqCompHz"])
+            freqGridLocal = np.arange(freqCenter - 40.0, freqCenter + 40.0 + step / 2.0, step, dtype=np.float64)
+            for ssbStartLocal in startGrid:
+                if ssbStartLocal < 0:
+                    continue
+                for freqHz in freqGridLocal:
+                    try:
+                        item = self._evaluateCandidate(
+                            rxSignal,
+                            nIdCell=nIdCell,
+                            ssbStart=int(ssbStartLocal),
+                            freqCompHz=float(freqHz),
+                            iSsbBar=int(best["iSsbBar"]),
+                            cpProfileName=cpProfileName,
+                            cpLengths=cpLengths,
+                        )
+                    except Exception:
+                        continue
+                    summary = {
+                        "iSsbBar": int(item["iSsbBar"]),
+                        "ssbStart": int(item["ssbStart"]),
+                        "freqCompHz": float(item["freqCompHz"]),
+                        "cpProfile": str(item.get("cpProfile", cpProfileName)),
+                        "evmPercent": float(item["evmPercent"]),
+                        "dmrsPower": float(item["dmrsPower"]),
+                        "channelStd": float(item["channelStd"]),
+                    }
+                    candidates.append(summary)
+                    if item["evmPercent"] < best["evmPercent"]:
+                        best = item
 
         if best is None:
             raise RuntimeError("PBCH candidate scan failed")
