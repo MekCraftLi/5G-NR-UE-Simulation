@@ -360,6 +360,43 @@ class PbchDecoder:
                     if item["evmPercent"] < best["evmPercent"]:
                         best = item
 
+        if best is not None:
+            cpProfileName = str(best.get("cpProfile", "all_normal"))
+            cpProfileMap = {name: vals for name, vals in cpProfiles}
+            cpLengths = [int(v) for v in cpProfileMap.get(cpProfileName, self._cpLengths())]
+            startCenter = int(best["ssbStart"])
+            localStarts = np.arange(startCenter - 2, startCenter + 2 + 1, dtype=np.int32)
+            freqCenter = float(best["freqCompHz"])
+            ultraGrid = np.arange(freqCenter - 8.0, freqCenter + 8.0 + 1.0, 2.0, dtype=np.float64)
+            for ssbStartLocal in localStarts:
+                if ssbStartLocal < 0:
+                    continue
+                for freqHz in ultraGrid:
+                    try:
+                        item = self._evaluateCandidate(
+                            rxSignal,
+                            nIdCell=nIdCell,
+                            ssbStart=int(ssbStartLocal),
+                            freqCompHz=float(freqHz),
+                            iSsbBar=int(best["iSsbBar"]),
+                            cpProfileName=cpProfileName,
+                            cpLengths=cpLengths,
+                        )
+                    except Exception:
+                        continue
+                    summary = {
+                        "iSsbBar": int(item["iSsbBar"]),
+                        "ssbStart": int(item["ssbStart"]),
+                        "freqCompHz": float(item["freqCompHz"]),
+                        "cpProfile": str(item.get("cpProfile", cpProfileName)),
+                        "evmPercent": float(item["evmPercent"]),
+                        "dmrsPower": float(item["dmrsPower"]),
+                        "channelStd": float(item["channelStd"]),
+                    }
+                    candidates.append(summary)
+                    if item["evmPercent"] < best["evmPercent"]:
+                        best = item
+
         if best is None:
             raise RuntimeError("PBCH candidate scan failed")
 
