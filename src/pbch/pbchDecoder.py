@@ -90,14 +90,24 @@ class PbchDecoder:
     def _cpLengths(self) -> list[int]:
         return [int(self.cpManager.getCpLength(i)) for i in range(4)]
 
+    def _cpLengthProfiles(self) -> list[tuple[str, list[int]]]:
+        normal = int(self.cpManager.normalCpLength)
+        long = int(self.cpManager.longCpLength)
+        profiles: list[tuple[str, list[int]]] = [
+            ("slot_head", [long, normal, normal, normal]),
+            ("all_normal", [normal, normal, normal, normal]),
+        ]
+        return profiles
+
     def _compensate(self, rxSignal: np.ndarray, freqCompHz: float) -> np.ndarray:
         n = np.arange(len(rxSignal), dtype=np.float64)
         phase = np.exp(-1j * 2.0 * np.pi * float(freqCompHz) * n / self.sampleRate).astype(np.complex64)
         return (np.asarray(rxSignal, dtype=np.complex64) * phase).astype(np.complex64)
 
-    def _extractSsbGrid(self, rxSignal: np.ndarray, ssbStart: int, freqCompHz: float) -> np.ndarray:
+    def _extractSsbGrid(self, rxSignal: np.ndarray, ssbStart: int, freqCompHz: float, cpLengths: list[int] | None = None) -> np.ndarray:
         compensated = self._compensate(rxSignal, freqCompHz)
-        symbols = self.ofdm.extractSsbSymbols(compensated, int(ssbStart), cpLengths=self._cpLengths())
+        useCp = self._cpLengths() if cpLengths is None else [int(v) for v in cpLengths]
+        symbols = self.ofdm.extractSsbSymbols(compensated, int(ssbStart), cpLengths=useCp)
         start = self.fftSize // 2 - self.SsbSubcarriers // 2 + self.ssbSubcarrierOffset
         grid = np.zeros((self.SsbSubcarriers, 4), dtype=np.complex64)
         for l, symbol in enumerate(symbols):
@@ -144,8 +154,17 @@ class PbchDecoder:
         den = np.mean(np.abs(reference) ** 2)
         return float(100.0 * np.sqrt(num / max(den, 1e-12)))
 
-    def _evaluateCandidate(self, rxSignal: np.ndarray, nIdCell: int, ssbStart: int, freqCompHz: float, iSsbBar: int) -> dict:
-        grid = self._extractSsbGrid(rxSignal, ssbStart=ssbStart, freqCompHz=freqCompHz)
+    def _evaluateCandidate(
+        self,
+        rxSignal: np.ndarray,
+        nIdCell: int,
+        ssbStart: int,
+        freqCompHz: float,
+        iSsbBar: int,
+        cpProfileName: str,
+        cpLengths: list[int],
+    ) -> dict:
+        grid = self._extractSsbGrid(rxSignal, ssbStart=ssbStart, freqCompHz=freqCompHz, cpLengths=cpLengths)
         dmrsItems = self._dmrsReList(nIdCell)
         dataItems = self._pbchDataReList(nIdCell)
         dmrsRx = self._extract(grid, dmrsItems)
@@ -172,6 +191,7 @@ class PbchDecoder:
             "iSsbBar": int(iSsbBar),
             "ssbStart": int(ssbStart),
             "freqCompHz": float(freqCompHz),
+            "cpProfile": str(cpProfileName),
             "grid": grid,
             "dmrsItems": dmrsItems,
             "dataItems": dataItems,
@@ -237,24 +257,35 @@ class PbchDecoder:
 
         candidates = []
         best = None
+        cpProfiles = self._cpLengthProfiles()
         for ssbStart in starts:
             for freqHz in freqGrid:
                 for iSsbBar in self.ssbIndexCandidates:
-                    try:
-                        item = self._evaluateCandidate(rxSignal, nIdCell=nIdCell, ssbStart=ssbStart, freqCompHz=float(freqHz), iSsbBar=iSsbBar)
-                    except Exception:
-                        continue
-                    summary = {
-                        "iSsbBar": int(iSsbBar),
-                        "ssbStart": int(ssbStart),
-                        "freqCompHz": float(freqHz),
-                        "evmPercent": float(item["evmPercent"]),
-                        "dmrsPower": float(item["dmrsPower"]),
-                        "channelStd": float(item["channelStd"]),
-                    }
-                    candidates.append(summary)
-                    if best is None or item["evmPercent"] < best["evmPercent"]:
-                        best = item
+                    for cpProfileName, cpLengths in cpProfiles:
+                        try:
+                            item = self._evaluateCandidate(
+                                rxSignal,
+                                nIdCell=nIdCell,
+                                ssbStart=ssbStart,
+                                freqCompHz=float(freqHz),
+                                iSsbBar=iSsbBar,
+                                cpProfileName=cpProfileName,
+                                cpLengths=cpLengths,
+                            )
+                        except Exception:
+                            continue
+                        summary = {
+                            "iSsbBar": int(iSsbBar),
+                            "ssbStart": int(ssbStart),
+                            "freqCompHz": float(freqHz),
+                            "cpProfile": str(cpProfileName),
+                            "evmPercent": float(item["evmPercent"]),
+                            "dmrsPower": float(item["dmrsPower"]),
+                            "channelStd": float(item["channelStd"]),
+                        }
+                        candidates.append(summary)
+                        if best is None or item["evmPercent"] < best["evmPercent"]:
+                            best = item
 
         if best is not None and residualFreqStepHz > 1.0:
             fineStepHz = max(1.0, float(residualFreqStepHz) / 10.0)
@@ -273,6 +304,8 @@ class PbchDecoder:
                         ssbStart=int(best["ssbStart"]),
                         freqCompHz=float(freqHz),
                         iSsbBar=int(best["iSsbBar"]),
+                        cpProfileName=str(best.get("cpProfile", "slot_head")),
+                        cpLengths=[int(v) for v in dict(cpProfiles).get(str(best.get("cpProfile", "slot_head")), self._cpLengths())],
                     )
                 except Exception:
                     continue
@@ -280,6 +313,7 @@ class PbchDecoder:
                     "iSsbBar": int(item["iSsbBar"]),
                     "ssbStart": int(item["ssbStart"]),
                     "freqCompHz": float(item["freqCompHz"]),
+                    "cpProfile": str(item.get("cpProfile", "slot_head")),
                     "evmPercent": float(item["evmPercent"]),
                     "dmrsPower": float(item["dmrsPower"]),
                     "channelStd": float(item["channelStd"]),
@@ -297,6 +331,7 @@ class PbchDecoder:
             "iSsbBar": int(best["iSsbBar"]),
             "ssbStart": int(best["ssbStart"]),
             "freqCompHz": float(best["freqCompHz"]),
+            "cpProfile": str(best.get("cpProfile", "slot_head")),
             "evmPercent": float(best["evmPercent"]),
             "evmPass10Percent": bool(float(best["evmPercent"]) < 10.0),
             "dmrsPower": float(best["dmrsPower"]),
