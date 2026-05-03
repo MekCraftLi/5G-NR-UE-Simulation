@@ -127,12 +127,12 @@ class PbchDecoder:
             h = np.asarray([hDmrs[i] for i in idx], dtype=np.complex64)
             if len(h) >= 5:
                 # Smooth DMRS channel estimates per symbol to reduce interpolation noise.
-                kernel = np.asarray([1.0, 3.0, 6.0, 7.0, 6.0, 3.0, 1.0], dtype=np.float32)
+                kernel = np.asarray([1.0, 4.0, 9.0, 15.0, 18.0, 15.0, 9.0, 4.0, 1.0], dtype=np.float32)
                 kernel = kernel / np.sum(kernel)
                 mag = np.abs(h).astype(np.float64)
                 pha = np.unwrap(np.angle(h)).astype(np.float64)
-                magPad = np.pad(mag, (3, 3), mode="edge")
-                phaPad = np.pad(pha, (3, 3), mode="edge")
+                magPad = np.pad(mag, (4, 4), mode="edge")
+                phaPad = np.pad(pha, (4, 4), mode="edge")
                 magSm = np.convolve(magPad, kernel.astype(np.float64), mode="valid")
                 phaSm = np.convolve(phaPad, kernel.astype(np.float64), mode="valid")
                 h = (magSm * np.exp(1j * phaSm)).astype(np.complex64)
