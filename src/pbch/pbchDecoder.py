@@ -119,6 +119,76 @@ class PbchDecoder:
         return np.asarray([grid[item.k, item.l] for item in items], dtype=np.complex64)
 
     @staticmethod
+    def _fitChannelFromDmrs(
+        dmrsItems: list[PbchRe],
+        hDmrs: np.ndarray,
+        dataItems: list[PbchRe],
+    ) -> np.ndarray:
+        bySymDmrs: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        for l in (1, 2, 3):
+            idx = [i for i, item in enumerate(dmrsItems) if item.l == l]
+            k = np.asarray([dmrsItems[i].k for i in idx], dtype=np.float64)
+            h = np.asarray([hDmrs[i] for i in idx], dtype=np.complex64)
+            order = np.argsort(k)
+            k = k[order]
+            h = h[order]
+            # New method: parametric channel model in frequency domain.
+            # 1) smooth phase/magnitude
+            phase = np.unwrap(np.angle(h)).astype(np.float64)
+            mag = np.abs(h).astype(np.float64)
+            if len(k) >= 7:
+                w = np.asarray([1.0, 6.0, 16.0, 30.0, 45.0, 56.0, 60.0, 56.0, 45.0, 30.0, 16.0, 6.0, 1.0], dtype=np.float64)
+                w = w / np.sum(w)
+                phase = np.convolve(np.pad(phase, (6, 6), mode="edge"), w, mode="valid")
+                mag = np.convolve(np.pad(mag, (6, 6), mode="edge"), w, mode="valid")
+
+            # 2) polynomial fit to suppress noise/outliers
+            degPhase = int(min(3, max(len(k) - 1, 1)))
+            degMag = int(min(2, max(len(k) - 1, 1)))
+            # Robust weighted LS fit: down-weight local outliers in pilot LS estimates.
+            medMag = np.median(mag)
+            madMag = np.median(np.abs(mag - medMag)) + 1e-9
+            rMag = np.abs(mag - medMag) / (1.4826 * madMag)
+            wMag = 1.0 / (1.0 + (rMag / 2.5) ** 2)
+
+            medPha = np.median(phase)
+            madPha = np.median(np.abs(phase - medPha)) + 1e-9
+            rPha = np.abs(phase - medPha) / (1.4826 * madPha)
+            wPha = 1.0 / (1.0 + (rPha / 2.5) ** 2)
+
+            phaseCoef = np.polyfit(k, phase, deg=degPhase, w=wPha)
+            magCoef = np.polyfit(k, np.log(np.maximum(mag, 1e-9)), deg=degMag, w=wMag)
+            phaseFit = np.polyval(phaseCoef, k)
+            magFit = np.exp(np.polyval(magCoef, k))
+            hFit = (magFit * np.exp(1j * phaseFit)).astype(np.complex64)
+            bySymDmrs[l] = (k, hFit)
+
+        hData = np.zeros(len(dataItems), dtype=np.complex64)
+        for i, item in enumerate(dataItems):
+            kRef, hRef = bySymDmrs[item.l]
+            magRef = np.abs(hRef).astype(np.float64)
+            phaseRef = np.unwrap(np.angle(hRef)).astype(np.float64)
+            mag = float(np.interp(float(item.k), kRef, magRef))
+            phase = float(np.interp(float(item.k), kRef, phaseRef))
+            hData[i] = np.complex64(mag * np.exp(1j * phase))
+        return hData
+
+    @staticmethod
+    def _decisionDirectedPhaseRefine(dataEq: np.ndarray, dataItems: list[PbchRe], iterations: int = 2) -> np.ndarray:
+        out = np.asarray(dataEq, dtype=np.complex64).copy()
+        for _ in range(max(0, int(iterations))):
+            for l in (1, 2, 3):
+                idx = [i for i, item in enumerate(dataItems) if item.l == l]
+                if not idx:
+                    continue
+                sym = out[np.asarray(idx, dtype=np.int32)]
+                ref, _ = PbchDecoder._nearestQpsk(sym)
+                metric = np.vdot(ref, sym)
+                cpe = np.angle(metric) if abs(metric) > 1e-12 else 0.0
+                out[np.asarray(idx, dtype=np.int32)] = sym * np.exp(-1j * cpe).astype(np.complex64)
+        return out
+
+    @staticmethod
     def _interpolateChannel(dmrsItems: list[PbchRe], hDmrs: np.ndarray, dataItems: list[PbchRe]) -> np.ndarray:
         hBySymbol: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for l in (1, 2, 3):
@@ -127,12 +197,12 @@ class PbchDecoder:
             h = np.asarray([hDmrs[i] for i in idx], dtype=np.complex64)
             if len(h) >= 5:
                 # Smooth DMRS channel estimates per symbol to reduce interpolation noise.
-                kernel = np.asarray([1.0, 6.0, 16.0, 30.0, 45.0, 56.0, 60.0, 56.0, 45.0, 30.0, 16.0, 6.0, 1.0], dtype=np.float32)
+                kernel = np.asarray([1.0, 7.0, 20.0, 40.0, 65.0, 90.0, 110.0, 118.0, 110.0, 90.0, 65.0, 40.0, 20.0, 7.0, 1.0], dtype=np.float32)
                 kernel = kernel / np.sum(kernel)
                 mag = np.abs(h).astype(np.float64)
                 pha = np.unwrap(np.angle(h)).astype(np.float64)
-                magPad = np.pad(mag, (6, 6), mode="edge")
-                phaPad = np.pad(pha, (6, 6), mode="edge")
+                magPad = np.pad(mag, (7, 7), mode="edge")
+                phaPad = np.pad(pha, (7, 7), mode="edge")
                 magSm = np.convolve(magPad, kernel.astype(np.float64), mode="valid")
                 phaSm = np.convolve(phaPad, kernel.astype(np.float64), mode="valid")
                 h = (magSm * np.exp(1j * phaSm)).astype(np.complex64)
@@ -183,8 +253,9 @@ class PbchDecoder:
         hDmrs = dmrsRx / dmrsRef
 
         dataRx = self._extract(grid, dataItems)
-        hData = self._interpolateChannel(dmrsItems, hDmrs, dataItems)
+        hData = self._fitChannelFromDmrs(dmrsItems, hDmrs, dataItems)
         dataEq = dataRx / np.where(np.abs(hData) > 1e-9, hData, 1.0 + 0j)
+        dataEq = self._decisionDirectedPhaseRefine(dataEq, dataItems, iterations=2)
 
         # Remove one residual common gain/phase so constellation EVM measures scatter, not arbitrary scaling.
         qpskRef0, _ = self._nearestQpsk(dataEq)
