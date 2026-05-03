@@ -121,9 +121,11 @@ class PbchDecoder:
         hData = np.zeros(len(dataItems), dtype=np.complex64)
         for i, item in enumerate(dataItems):
             kRef, hRef = hBySymbol[item.l]
-            real = np.interp(float(item.k), kRef, np.real(hRef))
-            imag = np.interp(float(item.k), kRef, np.imag(hRef))
-            hData[i] = np.complex64(real + 1j * imag)
+            magRef = np.abs(hRef).astype(np.float64)
+            phaseRef = np.unwrap(np.angle(hRef)).astype(np.float64)
+            mag = float(np.interp(float(item.k), kRef, magRef))
+            phase = float(np.interp(float(item.k), kRef, phaseRef))
+            hData[i] = np.complex64(mag * np.exp(1j * phase))
         return hData
 
     @staticmethod
