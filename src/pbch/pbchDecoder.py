@@ -144,7 +144,7 @@ class PbchDecoder:
 
             # 2) polynomial fit to suppress noise/outliers
             degPhase = int(min(2, max(len(k) - 1, 1)))
-            degMag = int(min(2, max(len(k) - 1, 1)))
+            degMag = int(min(1, max(len(k) - 1, 1)))
             # Robust weighted LS fit: down-weight local outliers in pilot LS estimates.
             medMag = np.median(mag)
             madMag = np.median(np.abs(mag - medMag)) + 1e-9
