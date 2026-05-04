@@ -340,34 +340,62 @@ class PbchDecoder:
         candidates = []
         best = None
         cpProfiles = self._cpLengthProfiles()
+        def evaluateAndRecord(ssbStart: int, freqHz: float, iSsbBar: int, cpProfileName: str, cpLens: list[int]) -> dict | None:
+            nonlocal best
+            try:
+                item = self._evaluateCandidate(
+                    rxSignal,
+                    nIdCell=nIdCell,
+                    ssbStart=int(ssbStart),
+                    freqCompHz=float(freqHz),
+                    iSsbBar=int(iSsbBar),
+                    cpProfileName=str(cpProfileName),
+                    cpLengths=[int(v) for v in cpLens],
+                )
+            except Exception:
+                return None
+            summary = {
+                "iSsbBar": int(item["iSsbBar"]),
+                "ssbStart": int(item["ssbStart"]),
+                "freqCompHz": float(item["freqCompHz"]),
+                "cpProfile": str(item.get("cpProfile", cpProfileName)),
+                "evmPercent": float(item["evmPercent"]),
+                "dmrsPower": float(item["dmrsPower"]),
+                "channelStd": float(item["channelStd"]),
+            }
+            candidates.append(summary)
+            if best is None or item["evmPercent"] < best["evmPercent"]:
+                best = item
+            return item
+
+        # Stage-1 compact coarse scan: prioritize iSsbBar=0; only scan full iSsbBar when needed.
+        preferredIbars = [0] if 0 in self.ssbIndexCandidates else [int(self.ssbIndexCandidates[0])]
         for ssbStart in starts:
             for freqHz in freqGrid:
-                for iSsbBar in self.ssbIndexCandidates:
-                    for cpProfileName, cpLengths in cpProfiles:
-                        try:
-                            item = self._evaluateCandidate(
-                                rxSignal,
-                                nIdCell=nIdCell,
-                                ssbStart=ssbStart,
-                                freqCompHz=float(freqHz),
-                                iSsbBar=iSsbBar,
-                                cpProfileName=cpProfileName,
-                                cpLengths=cpLengths,
-                            )
-                        except Exception:
-                            continue
-                        summary = {
-                            "iSsbBar": int(iSsbBar),
-                            "ssbStart": int(ssbStart),
-                            "freqCompHz": float(freqHz),
-                            "cpProfile": str(cpProfileName),
-                            "evmPercent": float(item["evmPercent"]),
-                            "dmrsPower": float(item["dmrsPower"]),
-                            "channelStd": float(item["channelStd"]),
-                        }
-                        candidates.append(summary)
-                        if best is None or item["evmPercent"] < best["evmPercent"]:
-                            best = item
+                for cpProfileName, cpLens in cpProfiles:
+                    for ib in preferredIbars:
+                        evaluateAndRecord(ssbStart, float(freqHz), ib, cpProfileName, cpLens)
+
+        # Fallback: if coarse best is still poor, expand iSsbBar scan.
+        if best is None or float(best["evmPercent"]) > 80.0:
+            for ssbStart in starts:
+                for freqHz in freqGrid:
+                    for cpProfileName, cpLens in cpProfiles:
+                        for ib in self.ssbIndexCandidates:
+                            evaluateAndRecord(ssbStart, float(freqHz), int(ib), cpProfileName, cpLens)
+
+        # Stage-2 Top-K refinement seeds.
+        rankedSeeds = sorted(candidates, key=lambda x: x["evmPercent"])[:3]
+        for seed in rankedSeeds:
+            cpProfileName = str(seed.get("cpProfile", "slot_head"))
+            cpMap = {name: vals for name, vals in cpProfiles}
+            cpLens = [int(v) for v in cpMap.get(cpProfileName, self._cpLengths())]
+            fineStepHz = max(1.0, float(residualFreqStepHz) / 10.0)
+            fineSearchHz = max(float(residualFreqStepHz), float(residualFreqStepHz) * 3.0)
+            fineResidual = np.arange(-abs(fineSearchHz), abs(fineSearchHz) + fineStepHz / 2.0, abs(fineStepHz))
+            fineGrid = float(seed["freqCompHz"]) + fineResidual
+            for freqHz in fineGrid:
+                evaluateAndRecord(int(seed["ssbStart"]), float(freqHz), int(seed["iSsbBar"]), cpProfileName, cpLens)
 
         if best is not None and residualFreqStepHz > 1.0:
             fineStepHz = max(1.0, float(residualFreqStepHz) / 10.0)
@@ -379,30 +407,13 @@ class PbchDecoder:
             )
             fineGrid = float(best["freqCompHz"]) + fineResidual
             for freqHz in fineGrid:
-                try:
-                    item = self._evaluateCandidate(
-                        rxSignal,
-                        nIdCell=nIdCell,
-                        ssbStart=int(best["ssbStart"]),
-                        freqCompHz=float(freqHz),
-                        iSsbBar=int(best["iSsbBar"]),
-                        cpProfileName=str(best.get("cpProfile", "slot_head")),
-                        cpLengths=[int(v) for v in dict(cpProfiles).get(str(best.get("cpProfile", "slot_head")), self._cpLengths())],
-                    )
-                except Exception:
-                    continue
-                summary = {
-                    "iSsbBar": int(item["iSsbBar"]),
-                    "ssbStart": int(item["ssbStart"]),
-                    "freqCompHz": float(item["freqCompHz"]),
-                    "cpProfile": str(item.get("cpProfile", "slot_head")),
-                    "evmPercent": float(item["evmPercent"]),
-                    "dmrsPower": float(item["dmrsPower"]),
-                    "channelStd": float(item["channelStd"]),
-                }
-                candidates.append(summary)
-                if item["evmPercent"] < best["evmPercent"]:
-                    best = item
+                evaluateAndRecord(
+                    int(best["ssbStart"]),
+                    float(freqHz),
+                    int(best["iSsbBar"]),
+                    str(best.get("cpProfile", "slot_head")),
+                    [int(v) for v in dict(cpProfiles).get(str(best.get("cpProfile", "slot_head")), self._cpLengths())],
+                )
 
         if best is not None:
             cpProfileName = str(best.get("cpProfile", "all_normal"))
@@ -417,30 +428,13 @@ class PbchDecoder:
                 if ssbStartLocal < 0:
                     continue
                 for freqHz in freqGridLocal:
-                    try:
-                        item = self._evaluateCandidate(
-                            rxSignal,
-                            nIdCell=nIdCell,
-                            ssbStart=int(ssbStartLocal),
-                            freqCompHz=float(freqHz),
-                            iSsbBar=int(best["iSsbBar"]),
-                            cpProfileName=cpProfileName,
-                            cpLengths=cpLengths,
-                        )
-                    except Exception:
-                        continue
-                    summary = {
-                        "iSsbBar": int(item["iSsbBar"]),
-                        "ssbStart": int(item["ssbStart"]),
-                        "freqCompHz": float(item["freqCompHz"]),
-                        "cpProfile": str(item.get("cpProfile", cpProfileName)),
-                        "evmPercent": float(item["evmPercent"]),
-                        "dmrsPower": float(item["dmrsPower"]),
-                        "channelStd": float(item["channelStd"]),
-                    }
-                    candidates.append(summary)
-                    if item["evmPercent"] < best["evmPercent"]:
-                        best = item
+                    evaluateAndRecord(
+                        int(ssbStartLocal),
+                        float(freqHz),
+                        int(best["iSsbBar"]),
+                        cpProfileName,
+                        cpLengths,
+                    )
 
         if best is not None:
             cpProfileName = str(best.get("cpProfile", "all_normal"))
@@ -454,30 +448,13 @@ class PbchDecoder:
                 if ssbStartLocal < 0:
                     continue
                 for freqHz in ultraGrid:
-                    try:
-                        item = self._evaluateCandidate(
-                            rxSignal,
-                            nIdCell=nIdCell,
-                            ssbStart=int(ssbStartLocal),
-                            freqCompHz=float(freqHz),
-                            iSsbBar=int(best["iSsbBar"]),
-                            cpProfileName=cpProfileName,
-                            cpLengths=cpLengths,
-                        )
-                    except Exception:
-                        continue
-                    summary = {
-                        "iSsbBar": int(item["iSsbBar"]),
-                        "ssbStart": int(item["ssbStart"]),
-                        "freqCompHz": float(item["freqCompHz"]),
-                        "cpProfile": str(item.get("cpProfile", cpProfileName)),
-                        "evmPercent": float(item["evmPercent"]),
-                        "dmrsPower": float(item["dmrsPower"]),
-                        "channelStd": float(item["channelStd"]),
-                    }
-                    candidates.append(summary)
-                    if item["evmPercent"] < best["evmPercent"]:
-                        best = item
+                    evaluateAndRecord(
+                        int(ssbStartLocal),
+                        float(freqHz),
+                        int(best["iSsbBar"]),
+                        cpProfileName,
+                        cpLengths,
+                    )
 
         if best is None:
             raise RuntimeError("PBCH candidate scan failed")
