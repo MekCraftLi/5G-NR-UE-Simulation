@@ -149,12 +149,12 @@ class PbchDecoder:
             medMag = np.median(mag)
             madMag = np.median(np.abs(mag - medMag)) + 1e-9
             rMag = np.abs(mag - medMag) / (1.4826 * madMag)
-            wMag = 1.0 / (1.0 + (rMag / 2.0) ** 2)
+            wMag = 1.0 / (1.0 + (rMag / 2.2) ** 2)
 
             medPha = np.median(phase)
             madPha = np.median(np.abs(phase - medPha)) + 1e-9
             rPha = np.abs(phase - medPha) / (1.4826 * madPha)
-            wPha = 1.0 / (1.0 + (rPha / 2.0) ** 2)
+            wPha = 1.0 / (1.0 + (rPha / 2.2) ** 2)
 
             phaseCoef = np.polyfit(k, phase, deg=degPhase, w=wPha)
             magCoef = np.polyfit(k, np.log(np.maximum(mag, 1e-9)), deg=degMag, w=wMag)
