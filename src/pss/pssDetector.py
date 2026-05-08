@@ -616,6 +616,49 @@ class PssDetector:
             "history": history,
         }
 
+    @staticmethod
+    def _selectStablePeakCandidate(
+        candidates: list[dict],
+        anchorFreqHz: float | None = None,
+        anchorNId2: int | None = None,
+        anchorTimingOffset: int | None = None,
+        peakRelTolerance: float = 1e-4,
+        peakAbsTolerance: float = 1e-9,
+    ) -> dict:
+        if not candidates:
+            raise ValueError("candidates is empty")
+
+        bestPeak = max(float(item.get("peakValue", -np.inf)) for item in candidates)
+        tol = max(float(peakAbsTolerance), abs(float(bestPeak)) * float(peakRelTolerance))
+        pool = [item for item in candidates if float(item.get("peakValue", -np.inf)) >= float(bestPeak) - tol]
+        if not pool:
+            pool = [max(candidates, key=lambda x: float(x.get("peakValue", -np.inf)))]
+
+        anchorNid = None if anchorNId2 is None else int(anchorNId2)
+        anchorTime = None if anchorTimingOffset is None else int(anchorTimingOffset)
+
+        def stableKey(item: dict) -> tuple:
+            freqHz = float(item.get("freqOffset", 0.0))
+            nId2 = int(item.get("nId2", 0))
+            timingOffset = int(item.get("timingOffset", 0))
+            peak = float(item.get("peakValue", -np.inf))
+            gscn = int(item.get("gscn", 0))
+            freqDist = abs(freqHz - float(anchorFreqHz)) if anchorFreqHz is not None else abs(freqHz)
+            nidDist = abs(nId2 - anchorNid) if anchorNid is not None else nId2
+            timeDist = abs(timingOffset - anchorTime) if anchorTime is not None else timingOffset
+            return (
+                float(freqDist),
+                int(nidDist),
+                int(timeDist),
+                -float(peak),
+                int(nId2),
+                int(timingOffset),
+                int(gscn),
+                float(freqHz),
+            )
+
+        return min(pool, key=stableKey)
+
     def _runParallelSearch(
         self,
         tasks: list[tuple[int, int, float]],
@@ -641,7 +684,7 @@ class PssDetector:
                 progress.advance(1, bestPeak=bestPeak)
                 results.append(result)
             progress.endStage()
-            return results
+            return sorted(results, key=lambda x: (int(x["taskIndex"]), int(x["gscn"]), float(x["freqHz"])))
 
         if self.parallelMode == "process":
             try:
@@ -668,7 +711,7 @@ class PssDetector:
                 results.append(result)
 
         progress.endStage()
-        return results
+        return sorted(results, key=lambda x: (int(x["taskIndex"]), int(x["gscn"]), float(x["freqHz"])))
 
     def detectPss(self, rxSignal: np.ndarray, validGscnList: list[tuple[int, float]]) -> dict:
         if len(validGscnList) == 0:
@@ -698,13 +741,7 @@ class PssDetector:
             coarseResults = self._runParallelSearch(coarseTasks, progress, "Stage4-Coarse")
 
             searchMatrix = np.zeros((len(validGscnList), 3), dtype=np.float32)
-            coarseBest = {
-                "gscn": int(validGscnList[0][0]),
-                "freqOffset": float(validGscnList[0][1]),
-                "nId2": 0,
-                "timingOffset": 0,
-                "peakValue": -1.0,
-            }
+            coarseCandidates: list[dict] = []
             for result in coarseResults:
                 taskIndex = int(result["taskIndex"])
                 gscn = int(result["gscn"])
@@ -712,14 +749,20 @@ class PssDetector:
                 for nId2 in (0, 1, 2):
                     peakValue, peakIndex = result["peaks"][nId2]
                     searchMatrix[taskIndex, nId2] = float(peakValue)
-                    if peakValue > coarseBest["peakValue"]:
-                        coarseBest = {
-                            "gscn": gscn,
-                            "freqOffset": freqHz,
-                            "nId2": int(nId2),
-                            "timingOffset": int(peakIndex),
-                            "peakValue": float(peakValue),
-                        }
+                    coarseCandidates.append({
+                        "gscn": gscn,
+                        "freqOffset": float(freqHz),
+                        "nId2": int(nId2),
+                        "timingOffset": int(peakIndex),
+                        "peakValue": float(peakValue),
+                    })
+
+            coarseBest = self._selectStablePeakCandidate(
+                candidates=coarseCandidates,
+                anchorFreqHz=0.0,
+                anchorNId2=0,
+                anchorTimingOffset=0,
+            )
 
             fineFreqList = self._buildFineSearchFreqs(float(coarseBest["freqOffset"]))
             fineTasks = [(idx, int(coarseBest["gscn"]), float(freq)) for idx, freq in enumerate(fineFreqList)]
@@ -732,24 +775,38 @@ class PssDetector:
             for nId2 in (0, 1, 2):
                 finePeakMatrix[taskIndex, nId2] = float(result["peaks"][nId2][0])
 
-        nId2BestMap: dict[int, dict] = {
-            0: {"nId2": 0, "gscn": int(coarseBest["gscn"]), "freqOffset": float(coarseBest["freqOffset"]), "timingOffset": 0, "peakValue": -1.0},
-            1: {"nId2": 1, "gscn": int(coarseBest["gscn"]), "freqOffset": float(coarseBest["freqOffset"]), "timingOffset": 0, "peakValue": -1.0},
-            2: {"nId2": 2, "gscn": int(coarseBest["gscn"]), "freqOffset": float(coarseBest["freqOffset"]), "timingOffset": 0, "peakValue": -1.0},
-        }
+        nId2Candidates: dict[int, list[dict]] = {0: [], 1: [], 2: []}
 
         for result in fineResults:
             freqHz = float(result["freqHz"])
             for nId2 in (0, 1, 2):
                 peakValue, peakIndex = result["peaks"][nId2]
-                if float(peakValue) > float(nId2BestMap[nId2]["peakValue"]):
-                    nId2BestMap[nId2] = {
-                        "nId2": int(nId2),
-                        "gscn": int(coarseBest["gscn"]),
-                        "freqOffset": float(freqHz),
-                        "timingOffset": int(peakIndex),
-                        "peakValue": float(peakValue),
-                    }
+                nId2Candidates[int(nId2)].append({
+                    "nId2": int(nId2),
+                    "gscn": int(coarseBest["gscn"]),
+                    "freqOffset": float(freqHz),
+                    "timingOffset": int(peakIndex),
+                    "peakValue": float(peakValue),
+                })
+
+        nId2BestMap: dict[int, dict] = {}
+        for nId2 in (0, 1, 2):
+            candidates = nId2Candidates[int(nId2)]
+            if candidates:
+                nId2BestMap[int(nId2)] = self._selectStablePeakCandidate(
+                    candidates=candidates,
+                    anchorFreqHz=float(coarseBest["freqOffset"]),
+                    anchorNId2=int(nId2),
+                    anchorTimingOffset=int(coarseBest["timingOffset"]),
+                )
+            else:
+                nId2BestMap[int(nId2)] = {
+                    "nId2": int(nId2),
+                    "gscn": int(coarseBest["gscn"]),
+                    "freqOffset": float(coarseBest["freqOffset"]),
+                    "timingOffset": int(coarseBest["timingOffset"]),
+                    "peakValue": -np.inf,
+                }
 
         parabolicPerNId2 = []
         parabolicMap: dict[int, dict] = {}
@@ -827,7 +884,12 @@ class PssDetector:
             )
             item["corrArray"] = corrArray
 
-        bestItem = max((nId2BestMap[0], nId2BestMap[1], nId2BestMap[2]), key=lambda x: x["peakValue"])
+        bestItem = self._selectStablePeakCandidate(
+            candidates=[nId2BestMap[0], nId2BestMap[1], nId2BestMap[2]],
+            anchorFreqHz=float(coarseBest["freqOffset"]),
+            anchorNId2=int(coarseBest["nId2"]),
+            anchorTimingOffset=int(coarseBest["timingOffset"]),
+        )
         finalParabolic = parabolicMap[int(bestItem["nId2"])]
         finalAdaptive = adaptiveMap[int(bestItem["nId2"])]
         finalParabolicFreqHz = (

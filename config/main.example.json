@@ -11,9 +11,14 @@
   "pss_lsq_min_r2": 0.8,
   "sss_enable": true,
   "pss_only": false,
+  "sss_freq_base_mode": "pss",
+  "sss_offset_candidates": [-48, -7, 0, 16, 36],
   "sss_start_symbol": 0.5,
   "sss_end_symbol": 2.5,
   "sss_step_samples": 1,
+  "pbch_enable": true,
+  "pbch_residual_freq_search_hz": 500.0,
+  "pbch_residual_freq_step_hz": 50.0,
   "progress_mode": "rich",
   "progress_refresh": 0.7
 }

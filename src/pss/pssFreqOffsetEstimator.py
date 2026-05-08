@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 class PssFreqOffsetEstimator:
     def __init__(self, config: SsbConfig):
         self.fftSize = int(config.FftSize)
+        # Use normal CP for PSS-assisted CFO estimation for a stable SS/PBCH mapping convention.
         self.cpLength = int(config.NormalCpLength)
         self.sampleRate = float(config.SampleRate)
         templatesWithCp = buildPssTimeDomainTemplates(config)

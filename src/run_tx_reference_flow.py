@@ -4,7 +4,7 @@ import argparse
 
 import numpy as np
 
-from common.config import createSsbConfig
+from common.config import createSsbConfigWithOverrides
 from common.cpManager import CpManager
 from common.gscn import GscnRaster
 from common.gscnRasterTable import buildGscnMatrix, findCasesByGscn
@@ -21,6 +21,9 @@ def _parseArgs(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TX reference PSS blind-search flow")
     parser.add_argument("--sample-rate", type=float, default=30.72e6, help="Sample rate in Hz")
     parser.add_argument("--scs", type=int, default=30000, help="Subcarrier spacing in Hz")
+    parser.add_argument("--fft-size", type=int, default=None, help="Override FFT size")
+    parser.add_argument("--normal-cp", type=int, default=None, help="Override normal CP length")
+    parser.add_argument("--ssb-subcarrier-offset", type=int, default=0, help="Offset of SSB from centered 240-SC window")
     parser.add_argument("--prb-count", type=int, default=51, help="PRB count used for GSCN matrix")
     parser.add_argument("--known-baseband", action="store_true", help="Use single candidate (gscn=0, freq=0)")
     parser.add_argument("--output-prefix", type=str, default="tx", help="Output prefix")
@@ -47,11 +50,18 @@ def main(argv: list[str] | None = None):
     logger.info(f"TX signal length: {len(txSignal)} samples")
 
     logger.info("2) Derive OFDM parameters")
-    ssbConfig = createSsbConfig(sampleRate=sampleRate, subcarrierSpacing=scs)
+    ssbConfig = createSsbConfigWithOverrides(
+        sampleRate=sampleRate,
+        subcarrierSpacing=scs,
+        fftSize=args.fft_size,
+        normalCpLength=args.normal_cp,
+        ssbSubcarrierOffset=int(args.ssb_subcarrier_offset),
+    )
     cpManager = CpManager(ssbConfig)
     logger.info(f"FFT: {ssbConfig.FftSize}")
     logger.info(f"Normal CP: {ssbConfig.NormalCpLength}")
     logger.info(f"Long CP: {cpManager.longCpLength}")
+    logger.info(f"SSB subcarrier offset: {ssbConfig.SsbSubcarrierOffset}")
 
     logger.info("3) Build TX carrier candidates")
     rasterEntries = []
@@ -59,16 +69,21 @@ def main(argv: list[str] | None = None):
         validFreqList = [(0, 0.0)]
         logger.info("Known baseband mode enabled: use single candidate (GSCN=0, freq=0)")
     else:
-        validFreqList, rasterEntries, meta = buildGscnMatrix(prbCount=int(args.prb_count), scsHz=scs)
-        logger.info(f"Occupied bandwidth: {meta['occupiedBandwidthMHz']:.3f} MHz")
-        if meta["inferredChannelBandwidthMHz"] is not None:
-            logger.info(f"Inferred channel bandwidth: {meta['inferredChannelBandwidthMHz']:.1f} MHz")
-        logger.info(f"SCS cases: {', '.join(meta['caseSet'])}")
-        logger.info(f"GSCN candidates: {len(validFreqList)}")
-        logger.info(
-            f"GSCN range: {validFreqList[0][0]} ~ {validFreqList[-1][0]}, "
-            f"absolute freq: {validFreqList[0][1] / 1e6:.3f} ~ {validFreqList[-1][1] / 1e6:.3f} MHz"
-        )
+        if scs == 60000:
+            logger.warning("No FR1 GSCN raster table for 60 kHz in this project; forcing known-baseband mode")
+            validFreqList = [(0, 0.0)]
+            rasterEntries = []
+        else:
+            validFreqList, rasterEntries, meta = buildGscnMatrix(prbCount=int(args.prb_count), scsHz=scs)
+            logger.info(f"Occupied bandwidth: {meta['occupiedBandwidthMHz']:.3f} MHz")
+            if meta["inferredChannelBandwidthMHz"] is not None:
+                logger.info(f"Inferred channel bandwidth: {meta['inferredChannelBandwidthMHz']:.1f} MHz")
+            logger.info(f"SCS cases: {', '.join(meta['caseSet'])}")
+            logger.info(f"GSCN candidates: {len(validFreqList)}")
+            logger.info(
+                f"GSCN range: {validFreqList[0][0]} ~ {validFreqList[-1][0]}, "
+                f"absolute freq: {validFreqList[0][1] / 1e6:.3f} ~ {validFreqList[-1][1] / 1e6:.3f} MHz"
+            )
 
     logger.info("4) Run TX PSS search")
     pssDetector = PssDetector(

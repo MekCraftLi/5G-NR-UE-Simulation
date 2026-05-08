@@ -105,6 +105,7 @@ class SsbConfig:
     SubcarrierSpacing: int
     FftSize: int
     NormalCpLength: int
+    SsbSubcarrierOffset: int = 0
 
     # 协议固定常量
     SsbSymbolCount: int = 4  # TS 38.211 Clause 7.4.3.1: SS/PBCH block 包含 4 个 OFDM 符号
@@ -147,5 +148,44 @@ def createSsbConfig(sampleRate: float, subcarrierSpacing: int) -> SsbConfig:
         SampleRate=sampleRate,
         SubcarrierSpacing=subcarrierSpacing,
         FftSize=fftSize,
-        NormalCpLength=normalCpLength
+        NormalCpLength=normalCpLength,
+    )
+
+
+def createSsbConfigWithOverrides(
+    sampleRate: float,
+    subcarrierSpacing: int,
+    fftSize: int | None = None,
+    normalCpLength: int | None = None,
+    ssbSubcarrierOffset: int = 0,
+    targetBandRaster: BandRasterConfig | None = None,
+) -> SsbConfig:
+    """Create SSB config with lab-waveform overrides.
+
+    The project defaults follow FR1 raster tables, but the provided reference
+    waveform uses 60 kHz SSB numerology at 122.88 Msps. This helper keeps the
+    standard path unchanged while allowing explicit lab parameters.
+    """
+    derivedFftSize = int(sampleRate / subcarrierSpacing) if fftSize is None else int(fftSize)
+    derivedCpLength = (
+        int(OfdmConstants.BaseNormalCpLength * derivedFftSize / OfdmConstants.BaseFftSize)
+        if normalCpLength is None
+        else int(normalCpLength)
+    )
+    raster = targetBandRaster
+    if raster is None and int(subcarrierSpacing) == 60000:
+        raster = BandRasterConfig(
+            FirstGscn=0,
+            LastGscn=0,
+            StepSize=1,
+            Scs=int(subcarrierSpacing),
+            SsBlockPattern="Lab60k",
+        )
+    return SsbConfig(
+        SampleRate=float(sampleRate),
+        SubcarrierSpacing=int(subcarrierSpacing),
+        FftSize=derivedFftSize,
+        NormalCpLength=derivedCpLength,
+        SsbSubcarrierOffset=int(ssbSubcarrierOffset),
+        TargetBandRaster=raster,
     )

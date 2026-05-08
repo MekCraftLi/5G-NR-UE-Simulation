@@ -23,8 +23,7 @@ class CpManager:
         # 常规 CP 长度: 从基准 FFT=2048 的 CP=144 缩放
         # 参考: TS 38.211 Clause 5.3.1
         # =================================================================
-        scalingFactor = self.config.FftSize / OfdmConstants.BaseFftSize
-        self.normalCpLength = int(OfdmConstants.BaseNormalCpLength * scalingFactor)
+        self.normalCpLength = int(self.config.NormalCpLength)
 
         # =================================================================
         # 长 CP 长度: 由时隙总采样数反推

@@ -114,8 +114,13 @@ class SssVisualizer:
             "bestOffsetSamples": int(sssResult["bestOffsetSamples"]),
             "bestSymbolStart": int(sssResult["bestSymbolStart"]),
             "bestScore": float(sssResult["bestScore"]),
+            "verifiedSymbolStart": int(sssResult.get("verifiedSymbolStart", sssResult["bestSymbolStart"])),
+            "verifiedFreqCompHz": float(sssResult.get("verifiedFreqCompHz", sssResult.get("freqCompHz", 0.0))),
+            "verifiedResidualFreqHz": float(sssResult.get("verifiedResidualFreqHz", 0.0)),
+            "verifiedFdScore": float(sssResult.get("verifiedFdScore", 0.0)),
             "windowCount": int(len(offsets)),
             "topCandidates": sssResult.get("topCandidates", []),
+            "verifiedCandidates": sssResult.get("verifiedCandidates", []),
             "savedFiles": {
                 "figure": os.path.abspath(figPath),
                 "correlationNpz": os.path.abspath(npzPath),
